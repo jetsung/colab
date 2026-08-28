@@ -17,7 +17,7 @@
 #
 # 环境变量(可被外部/命令行覆盖):
 #   LLAMA_MODEL_REPO  模型仓库(不可为空; 未设置时回退 MODEL_REPO)
-#   LLAMA_MODEL_NAME  模型名前缀(未设置时从 REPO 提取: / 后部分去 -GGUF); 同时用作服务 --alias 别名
+#   LLAMA_MODEL_NAME  模型名前缀(未设置时从 REPO 提取: / 后部分去 -GGUF); 服务 --alias 为其小写形式
 #   LLAMA_QUANT       量化档(不可为空, 无默认; 由 .envrc / gpu profile 提供)
 #   LLAMA_MODEL_DIR   模型目录(默认 /content/models/<repo名>/<quant>)
 #   LLAMA_DIR       安装目录(默认 /content/llama.cpp; 由 .envrc 导出, 可覆盖)
@@ -55,6 +55,9 @@ if [[ -z "${LLAMA_MODEL_NAME:-}" ]]; then
   LLAMA_MODEL_NAME="${LLAMA_REPO_NAME%-GGUF}"   # 去除末尾 -GGUF 后缀
 fi
 readonly LLAMA_MODEL_NAME
+# 服务别名: 模型名转小写(LLAMA_MODEL_NAME 保留原样, 用于分片文件匹配)
+# 例: Qwen3.8-Flash-Next -> qwen3.8-flash-next
+readonly LLAMA_MODEL_ALIAS="${LLAMA_MODEL_NAME,,}"
 # 无默认值: 必须由外部提供(.envrc / gpu profile / 命令行); 此处仅声明空以规避 set -u
 readonly LLAMA_QUANT="${LLAMA_QUANT:-}"
 # 模型目录: 默认用仓库名(保留 -GGUF 后缀)
@@ -293,11 +296,11 @@ do_start() {
 
   # 展开后的启动命令(回显 + 写入日志, 便于排查)
   # 官方统一命令: llama serve(参数与旧 llama-server 一致)
-  # --alias: 模型别名(默认 = LLAMA_MODEL_NAME, 即剃除 / 前缀与 -GGUF 后缀的仓库名),
+  # --alias: 模型别名(默认 = LLAMA_MODEL_ALIAS, 即模型名的小写形式),
   #          避免 API 中显示为实际文件路径
   local   LAUNCH_CMD=("$LLAMA_SERVER" serve
     -m "$MODEL_FILE"
-    --alias "$LLAMA_MODEL_NAME"
+    --alias "$LLAMA_MODEL_ALIAS"
     -ngl "$LLAMA_NGL"
     --host "$HOST"
     --port "$PORT"
@@ -396,11 +399,11 @@ do_test() {
     AUTH=(-H "Authorization: Bearer $LLAMA_API_KEY")
   fi
 
-  echo ">> 发送测试对话 (model=${LLAMA_MODEL_NAME}, port=${PORT}) ..."
+  echo ">> 发送测试对话 (model=${LLAMA_MODEL_ALIAS}, port=${PORT}) ..."
   curl -s --max-time 30 "http://localhost:${PORT}/v1/chat/completions" \
     "${AUTH[@]}" \
     -H "Content-Type: application/json" \
-    -d "{\"model\": \"${LLAMA_MODEL_NAME}\", \"messages\": [{\"role\": \"user\", \"content\": \"你好, 请用一句话回复\"}], \"max_tokens\": 64}" \
+    -d "{\"model\": \"${LLAMA_MODEL_ALIAS}\", \"messages\": [{\"role\": \"user\", \"content\": \"你好, 请用一句话回复\"}], \"max_tokens\": 64}" \
     | python3 -c 'import sys,json; d=json.load(sys.stdin); print("回复:", d["choices"][0]["message"]["content"])' 2>/dev/null \
     || { echo "错误: 请求失败, 请检查服务状态" >&2; exit 1; }
 }
