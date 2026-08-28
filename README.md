@@ -41,7 +41,7 @@ colab/
 
 ## 快速开始
 
-> 完整安装与使用教程（含 llama.cpp 编译/量化、SGLang 参数详解、API 示例、FAQ）见 [DOCS.md](./DOCS.md)。
+> 完整安装与使用教程（含 llama.cpp prerelease 通用预编译/ CUDA 源码编译、量化、SGLang 参数详解、API 示例、FAQ）见 [DOCS.md](./DOCS.md)。
 > 所有操作均通过根目录 `colab.sh` 统一入口执行，子命令详情见 `./colab.sh --help`。
 
 宿主机安装 Colab CLI 并创建 GPU 会话，连进 Colab terminal 后按需选择引擎：
@@ -70,7 +70,8 @@ cd .. && ./colab.sh bore start     # 暴露到公网
 ### 引擎二：llama.cpp（llama/）
 
 ```bash
-./colab.sh install llama           # 编译 llama.cpp（含依赖与架构探测）
+./colab.sh install llama           # 下载最新 prerelease Ubuntu 通用预编译二进制
+# ./colab.sh install llama --build   # GPU/CUDA 或需源码编译时使用
 export HF_TOKEN=hf_xxxx            # 下载 GGUF 所需（需先接受模型许可证）
 cd llama && ./launch.sh start      # 下载模型并启动 llama-server
 ./launch.sh status                 # 查看状态 + 健康检查

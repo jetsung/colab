@@ -30,7 +30,7 @@ BORE_PORT ?= 65535
 .PHONY: install create sessions mount all \
         setup setup-deps setup-tools setup-bore setup-relaydrop \
         setup-opencode setup-codebuddy setup-hint \
-        install-llama install-sglang \
+        install-llama install-llama-build install-sglang \
         llama llama-start llama-stop llama-restart llama-status llama-test llama-logs llama-keep \
         sglang sglang-start sglang-stop sglang-restart sglang-status sglang-test sglang-logs sglang-keep \
         bore bore-start bore-stop bore-restart bore-status bore-logs \
@@ -125,9 +125,16 @@ setup-hint:
 
 # ================== [Colab/install] 引擎环境安装 ==================
 
-## [Colab/install] install-llama: 编译 llama.cpp(PR #27742, 含依赖与架构探测)
+# llama 安装参数，可传 --build 或 -B；默认为空(下载预编译二进制)
+LLAMA_INSTALL_ARGS ?=
+
+## [Colab/install] install-llama: 安装 llama.cpp(LLAMA_INSTALL_ARGS=--build 或 -B 可源码编译)
 install-llama:
-	bash $(SCRIPT) install llama
+	bash $(SCRIPT) install llama $(LLAMA_INSTALL_ARGS)
+
+## [Colab/install] install-llama-build: 使用源码编译方式安装 llama.cpp(等价 --build)
+install-llama-build:
+	bash $(SCRIPT) install llama --build
 
 ## [Colab/install] install-sglang: 建 venv + 装 SGLang(不自动启动)
 install-sglang:

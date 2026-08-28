@@ -18,7 +18,7 @@
 | 项目 | 要求 |
 |------|------|
 | GPU | NVIDIA，计算能力需被 CUDA 支持（Blackwell sm_120 需 CUDA ≥ 12.8） |
-| 编译工具 | `git`、`cmake`(≥3.20)、`gcc`/`g++`、`make`、`nvcc` |
+| 编译工具（仅 `--build`） | `git`、`cmake`(≥3.20)、`gcc`/`g++`、`make`、`nvcc` |
 | 运行时 | Python 3（仅用于下载），`huggingface_hub` + `hf_xet`（经 **uv** 安装） |
 | HuggingFace | 一个 **已接受模型许可证** 的 token（`HF_TOKEN`），否则 LFS/Xet 下载会被拒 |
 | 磁盘 | 模型约 74GB（`UD-Q2_K_XL`）~105GB（`UD-Q4_K_XL`），请预留 ≥120GB（仅 Q2）或 ≥180GB（Q2+Q4 并存） |
@@ -28,20 +28,28 @@
 
 ---
 
-## 2. 安装（编译 llama.cpp）
+## 2. 安装（预编译优先）
 
 ```bash
 ./colab.sh install llama
 ```
 
-脚本会：检查工具链 → 自动探测 CUDA 架构（如 12.0→`120`）→ `uv pip install huggingface_hub hf_xet` → 克隆 `ggml-org/llama.cpp` → checkout **PR #27742** → CMake 配置（CUDA）→ 编译。
+默认会从 GitHub Releases 选择 llama.cpp 最新 **prerelease**，下载 `ubuntu-x64.tar.gz` Ubuntu 通用预编译二进制，并解压到 `/content/llama.cpp/build/bin/`。该包不含 CUDA。
+
+GPU/CUDA 用户或需要特定未发布 PR 时，使用源码编译：
+
+```bash
+./colab.sh install llama --build
+```
+
+源码编译流程会检查工具链 → 自动探测 CUDA 架构（如 12.0→`120`）→ `uv pip install huggingface_hub hf_xet` → 克隆 `ggml-org/llama.cpp` → checkout **PR #27742** → CMake 配置（CUDA）→ 编译。
 
 产物：`/content/llama.cpp/build/bin/llama-server`。
 
 可选环境变量：
 - `LLAMA_DIR`：llama.cpp 目录（默认 `/content/llama.cpp`）
 - `LLAMA_CUDA_ARCH`：强制指定架构（如 `120` / `90` / `89`），不填则自动探测
-- `CLEAN=1 ./colab.sh install llama`：清掉 `build/` 重新编译
+- `CLEAN=1 ./colab.sh install llama --build`：清掉 `build/` 重新编译
 
 ---
 
@@ -146,7 +154,7 @@ curl http://localhost:30000/v1/chat/completions \
 - **下载卡在 11MB / "Entry not found"**
   → 没装 `hf_xet`（Xet 存储）。重跑 `./colab.sh install llama`；并确认 `HF_TOKEN` 已设置且**已接受许可证**。
 - **`qwen4exp` / 架构不支持**
-  → 用的是主线 llama.cpp。必须来自 **PR #27742**（`./colab.sh install llama` 已处理）。
+  → 预编译 prerelease 若仍不包含该架构支持，可用 **PR #27742** 源码编译：`./colab.sh install llama --build`。
 - **CUDA out of memory**
   → 模型或上下文太大。换更小量化（`UD-Q2_K_XL`→`UD-IQ1_M`）、降低 `LLAMA_CTX`，或多卡用 `--tensor-split`。
 - **安全风险**
@@ -160,7 +168,7 @@ curl http://localhost:30000/v1/chat/completions \
 
 ```
 colab/
-├── colab.sh            # 一体化入口: ./colab.sh install llama 编译引擎
+├── colab.sh            # 一体化入口: ./colab.sh install llama 安装引擎（默认 prerelease 预编译）
 ├── logs/llama_server.log   # 服务日志（根目录 logs/）
 ├── llama/
 │   ├── .envrc          # direnv: 继承根 .envrc + 按 GPU 加载 .env.g4/.env.t4

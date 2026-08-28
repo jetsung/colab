@@ -51,27 +51,29 @@
 
 # Part A：llama.cpp
 
-> **项目已内置一键脚本**：`./colab.sh install llama` 编译 CUDA 版 llama.cpp
-> 并安装 HuggingFace/Xet 依赖；`llama/launch.sh` 管理服务（下载 GGUF 模型、启动/停止/状态等）。
+> **项目已内置一键脚本**：`./colab.sh install llama` 默认选择 llama.cpp GitHub 最新 prerelease，下载 Ubuntu 通用预编译二进制（不含 CUDA）；
+> GPU/CUDA 用户应使用 `./colab.sh install llama --build` 源码编译。脚本同时安装 HuggingFace/Xet 依赖；`llama/launch.sh` 管理服务（下载 GGUF 模型、启动/停止/状态等）。
 > 直接使用即可（见 [llama/README.md](./llama/README.md)）。下方为两种手动方式，便于理解与自定义。
 
 ## A1. 安装 llama.cpp
 
 llama.cpp 提供两种方式：**下载预编译二进制**（最快）或 **源码编译 CUDA 版**（可针对 Colab GPU 优化）。
 
-> 项目内置脚本对应「方式二」的自动化：`./colab.sh install llama` 会自动探测 CUDA 架构、
-> 克隆 llama.cpp、配置 CUDA 并编译，产物在 `/content/llama.cpp/build/bin/llama-server`。
+> 项目内置脚本默认对应「方式一」的自动化：`./colab.sh install llama` 会从 GitHub Releases
+> 选择最新 prerelease 的 `ubuntu-x64.tar.gz` 通用资产，解压到 `/content/llama.cpp/build/bin/`。
+> 该预编译包不含 CUDA；需要 GPU/CUDA 时使用 `./colab.sh install llama --build`。
 
-### A1.1 方式一：预编译二进制（推荐，最快）
+### A1.1 方式一：Ubuntu 通用预编译二进制（最快；GPU/CUDA 请用源码编译）
 
-从 [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 下载
-`llama-<build>-bin-ubuntu-x64.zip`（含 CUDA 支持），解压后即可用 `llama-server`：
+从 [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 的最新 prerelease 下载
+`llama-<build>-bin-ubuntu-x64.tar.gz`（Ubuntu 通用版，不含 CUDA），解压后即可用 `llama-server`：
 
 ```bash
 cd ~
-wget <llama-XXXX-bin-ubuntu-x64.zip 链接>
-unzip llama-*-bin-ubuntu-x64.zip -d llama.cpp
-cd llama.cpp
+wget <llama-XXXX-bin-ubuntu-x64.tar.gz 链接>
+mkdir -p llama.cpp
+tar -xzf llama-*-bin-ubuntu-x64.tar.gz -C llama.cpp
+cd llama.cpp/llama-*
 chmod +x llama-server
 ./llama-server --version
 ```
@@ -487,7 +489,7 @@ nvidia-smi                               # 显存占用
 与 llama.cpp 的 `-DCMAKE_CUDA_ARCHITECTURES` 取值。
 
 **Q2: llama.cpp 启动报 CUDA 相关错误？**
-确认编译/下载的是 CUDA 版；用 `-DGGML_CUDA=on` 重编或改下预编译 CUDA 包；
+确认使用的是 CUDA 源码编译版；执行 `./colab.sh install llama --build`（或用 `-DGGML_CUDA=on` 手动重编）；
 `-ngl 999` 全 GPU 前确认显存足够，不足则减小 `-ngl` 或降量化。
 
 **Q3: 显存不足（OOM）怎么办？**

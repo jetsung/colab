@@ -6,7 +6,7 @@
 # 子命令:
 #   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
 #   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
-#   install <engine> [--build|-B]       Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认官方预编译二进制, --build 编译源码)
+#   install <engine> [--build|-B]       Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
 #   llama start|stop|restart|status|test|logs|keep   Colab 内: llama.cpp 服务管理(透传 llama/launch.sh)
 #   sglang start|stop|restart|status|test|logs|keep  Colab 内: SGLang 服务管理(透传 sglang/launch.sh)
 #   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
@@ -37,7 +37,7 @@ usage_root() {
 子命令:
   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
-  install <engine> [--build|-B]          Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认官方预编译二进制, --build 编译源码)
+  install <engine> [--build|-B]          Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
   llama start|stop|restart|status|test|logs|keep   Colab 内: llama.cpp 服务管理(动作见 llama -h)
   sglang start|stop|restart|status|test|logs|keep  Colab 内: SGLang 服务管理(动作见 sglang -h)
   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
@@ -138,12 +138,12 @@ usage_install() {
   Colab terminal(tmux) 环境内: 安装并启用引擎运行环境(Python 依赖统一用 uv 管理)
   engine:
     llama     安装 llama.cpp 服务
-              默认: 下载官方预编译二进制(ubuntu-cuda-x64, 快速免编译)
+              默认: 下载 GitHub 最新 prerelease 官方预编译二进制(ubuntu-x64, 通用版)
               --build / -B: 编译源码(支持 Qwen3.8-Flash-Next 的 PR #27742)
     sglang    建 venv + 装 SGLang(不自动启动, 启动请另跑 sglang/launch.sh)
 
 选项:
-  --build, -B   llama 使用源码编译方式(默认官方预编译二进制)
+  --build, -B   llama 使用源码编译方式(默认下载 GitHub 最新 prerelease 通用预编译二进制; GPU CUDA 请用此选项)
   -h, --help    显示本帮助
 EOF
 }
@@ -466,53 +466,96 @@ install_llama_build() {
   echo ">> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/llama/launch.sh"
 }
 
-# --------------- install llama: 官方预编译二进制(ubuntu-cuda-x64) ---------------
-# 从 GitHub 最新 release 下载官方 CUDA 版二进制, 解压到 $LLAMA_DIR/build/bin/
-# (与编译版路径一致, launch.sh 默认 LLAMA_SERVER 无需改动)
+# -------- install llama: 最新 prerelease 官方预编译二进制(ubuntu-x64) --------
+# 从 GitHub 最新 prerelease 下载官方 Ubuntu 通用二进制, 解压到 $LLAMA_DIR/build/bin/
+# (预编译包不含 CUDA; GPU 用户请用 --build 编译 CUDA 版本)
 install_llama_prebuilt() {
   local LLAMA_DIR="${LLAMA_DIR:-/content/llama.cpp}"
   local BIN_DIR="${LLAMA_DIR}/build/bin"
-  local TMP_ZIP="/tmp/llama_cuda_prebuilt.zip"
+  local TMP_TAR="/tmp/llama_prebuilt.tar.gz"
   local TMP_DIR="/tmp/llama_prebuilt"
 
-  echo ">> 下载 llama.cpp 官方预编译二进制 (ubuntu-cuda-x64)"
+  echo ">> 下载 llama.cpp 最新 prerelease 官方预编译二进制 (ubuntu-x64, 通用版)"
   echo ">> 安装目录: $LLAMA_DIR (二进制: $BIN_DIR/llama-server)"
 
-  if ! command -v unzip >/dev/null 2>&1; then
-    echo "ERROR: 缺少 unzip, 请先安装 (apt install -y unzip)" >&2
+  if ! command -v tar >/dev/null 2>&1; then
+    echo "ERROR: 缺少 tar, 请先安装 (apt install -y tar)" >&2
     exit 1
   fi
 
-  # 解析最新 release 中 CUDA 资产的下载地址(GitHub API)
-  local asset_url
-  asset_url=$(curl -fsSL https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | python3 -c '
-import sys, json
-for a in json.load(sys.stdin).get("assets", []):
-    if "bin-ubuntu-cuda-x64.zip" in a["name"]:
-        print(a["browser_download_url"]); break
-' 2>/dev/null || true)
-  if [[ -z "$asset_url" ]]; then
-    echo "ERROR: 未找到 llama.cpp 最新 release 的 ubuntu-cuda-x64 二进制资产" >&2
+  # 选择最新非 draft prerelease 中 Ubuntu 通用资产的下载地址(GitHub API)
+  local releases_json
+  if ! releases_json="$(curl -fsSL --retry 2 --connect-timeout 10 \
+    'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100')"; then
+    echo "ERROR: 无法获取 llama.cpp GitHub releases 列表" >&2
     exit 1
   fi
+
+  local release_info release_tag asset_url
+  if ! release_info="$(python3 -c '
+import json
+import sys
+
+try:
+    releases = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError) as exc:
+    print(f"无法解析 GitHub releases 响应: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+candidates = [
+    release for release in releases
+    if release.get("prerelease") is True and release.get("draft") is not True
+]
+if not candidates:
+    print("未找到可用的 prerelease", file=sys.stderr)
+    sys.exit(1)
+
+release = max(
+    candidates,
+    key=lambda item: item.get("published_at") or item.get("created_at") or "",
+)
+asset = next(
+    (
+        item for item in release.get("assets", [])
+        if "bin-ubuntu-x64.tar.gz" in item.get("name", "")
+        and item.get("browser_download_url")
+    ),
+    None,
+)
+if asset is None:
+    print(
+        "最新 prerelease {} 未找到 ubuntu-x64.tar.gz 二进制资产".format(
+            release.get("tag_name", "未知")
+        ),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print(release.get("tag_name", "未知"), asset["browser_download_url"], sep="\t")
+' <<<"$releases_json")"; then
+    echo "ERROR: llama.cpp 最新 prerelease 没有可用的 ubuntu-x64.tar.gz 二进制资产" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r release_tag asset_url <<<"$release_info"
+  echo ">> prerelease: $release_tag"
   echo ">> 资产: $asset_url"
 
-  curl -fL "$asset_url" -o "$TMP_ZIP" || { echo "ERROR: 下载失败" >&2; exit 1; }
+  curl -fL "$asset_url" -o "$TMP_TAR" || { echo "ERROR: 下载失败" >&2; exit 1; }
   rm -rf "$TMP_DIR"
   mkdir -p "$TMP_DIR"
-  unzip -q "$TMP_ZIP" -d "$TMP_DIR" || { echo "ERROR: 解压失败" >&2; exit 1; }
+  tar -xzf "$TMP_TAR" -C "$TMP_DIR" || { echo "ERROR: 解压失败" >&2; exit 1; }
 
-  # 定位 llama-server, 将所在 bin/ 目录全部复制(含 .so 依赖库)
+  # 定位 llama-server, 将所在目录全部复制(含 .so 依赖库)
   local server_bin
   server_bin=$(find "$TMP_DIR" -type f -name llama-server | head -1 || true)
   if [[ -z "$server_bin" ]]; then
     echo "ERROR: 压缩包内未找到 llama-server" >&2
-    rm -rf "$TMP_DIR" "$TMP_ZIP"
+    rm -rf "$TMP_DIR" "$TMP_TAR"
     exit 1
   fi
   mkdir -p "$BIN_DIR"
   cp -a "$(dirname "$server_bin")/." "$BIN_DIR/"
-  rm -rf "$TMP_DIR" "$TMP_ZIP"
+  rm -rf "$TMP_DIR" "$TMP_TAR"
 
   [[ -x "$BIN_DIR/llama-server" ]] || chmod +x "$BIN_DIR/llama-server"
   echo ">> 完成。二进制: $BIN_DIR/llama-server"
