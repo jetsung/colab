@@ -18,7 +18,7 @@
 | `colab.sh install sglang` | 根目录 | Colab terminal | 装环境：装 uv → 建 Python 3.12 venv → 装 SGLang（含已知坑修复）；**不自动启动服务**，启动请另跑 `./launch.sh start` |
 | `launch.sh` | `sglang/` | Colab terminal | 服务管理：`start` / `stop` / `restart` / `status` / `logs` / `keep`（守护） |
 | `.envrc` | `sglang/` | Colab terminal | direnv：继承根 `.envrc`，按 `GPU_PROFILE`（或自动探测）加载 `.env.g4`/`.env.t4`，并声明 `SGLANG_*` 空默认（留空即自动推导） |
-| `.env.g4` / `.env.t4` | `sglang/` | Colab terminal | GPU profile（`SGLANG_FLASHINFER_CUDA_ARCH_LIST` / `SGLANG_MEM_FRACTION_STATIC` / `SGLANG_CONTEXT_LENGTH` 等） |
+| `.env.g4` / `.env.t4` | `sglang/` | Colab terminal | GPU profile（`SGLANG_FLASHINFER_CUDA_ARCH_LIST` / `SGLANG_MEM_FRACTION_STATIC` / `SGLANG_CTX` 等） |
 | `colab.sh bore` | 根目录 | Colab terminal | bore 公网隧道：`30000 → ${BORE_PORT:-65535}`，setsid 后台托管，日志 `logs/bore.log` |
 | `sglang.ipynb` | `sglang/` | Colab | 部署流程 Notebook 版：等价于在 terminal 依次执行 setup/install/launch/bore，另含 .env 加载、就绪等待与 API 验证单元格；上传后 Run All 即可，项目路径可自定义（第 0 节填写）或按 环境变量→工作目录→子目录→Drive 自动探测 |
 | `.envrc`（根） | 根目录 | Colab terminal | direnv 入口：`PATH_add`、`API_KEY` / `MODEL_REPO` / `BORE_PORT` 默认值、`dotenv` 加载 `.env`（`.env` 不入 git） |
@@ -124,7 +124,7 @@ print(resp.choices[0].message.content)            # 最终回答
 | `SGLANG_MODEL_REPO` | 模型路径（HF ID 或本地路径）；未设置时回退 `MODEL_REPO`（默认 `Qwen/Qwen3.8-27B`）；**两者均空时启动报错** |
 | `SGLANG_SERVED_NAME` | API 中的模型别名，默认=模型路径末段（小写、斜杠转连字符） |
 | `SGLANG_HOST` / `SGLANG_PORT` | 监听地址与端口（默认 `0.0.0.0` / `30000`） |
-| `SGLANG_CONTEXT_LENGTH` | 最大上下文长度，留空时由 `config.json` 的 `max_position_embeddings` 推导，再回退模型默认 |
+| `SGLANG_CTX` | 最大上下文长度，默认 `0`=由 `config.json` 的 `max_position_embeddings` 自动推导；显式设正值可覆盖 |
 | `SGLANG_API_KEY` | 鉴权密钥；未设置时回退 `API_KEY`；两者均**未设置**时 `start` 报错（显式置空任一可关闭鉴权） |
 | `SGLANG_REASONING_PARSER` / `SGLANG_TOOL_CALL_PARSER` | 推理/工具调用解析器，留空时由脚本按模型家族推导（qwen→`qwen3`/`qwen3_coder`、deepseek→`deepseek_v3`、glm→`glm45`，其余不注入交由 SGLang 自动识别）；显式设置可覆盖 |
 | `SGLANG_CHAT_TEMPLATE_KWARGS` | chat template 参数（JSON），留空时按家族推导（qwen→`{"enable_thinking": true}`） |

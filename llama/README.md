@@ -89,9 +89,15 @@ cd llama
 | `LLAMA_MODEL_DIR` | `/content/models/<repo名>/<quant>` | 本地模型目录 |
 | `LLAMA_SERVER` | `/content/llama.cpp/build/bin/llama-server` | llama-server 二进制路径 |
 | `LLAMA_HOST` / `LLAMA_PORT` | `0.0.0.0` / `30000` | 监听地址与端口 |
-| `LLAMA_CTX` / `LLAMA_NGL` | `4096` / `999` | 上下文长度 / GPU 层数 |
+| `LLAMA_CTX` / `LLAMA_NGL` | `0` / `999` | 上下文长度（0=自动按空闲显存拟合）/ GPU 层数 |
 | `LLAMA_API_KEY` | 回退 `API_KEY` | 服务器 API 鉴权密钥 |
 | `LLAMA_XET` | `1` | 1=启用 HF Xet 存储（默认），0=禁用 |
+| `LLAMA_MMPROJ` | 自动检测 `模型目录/mmproj-*.gguf` | 视觉投影器路径（图片输入）；缺省自动下载 `mmproj-*.gguf` |
+| `LLAMA_MMPROJ_REPO` | 同 `LLAMA_MODEL_REPO` | mmproj 自动下载源；设为空串禁用自动下载 |
+
+> mmproj 采用**动态能力检测**：启动前解析主模型 GGUF 元数据，仅当存在 `image_token_id`/视觉键
+> （如 qwen4exp 的 `qwen4exp.ple.image_token_id`）时才加载 mmproj；换用纯文本模型时会自动跳过，
+> 不会把不相干的 mmproj 传给文本模型。检测依赖 `llama-gguf`（与 `llama` 同目录），缺失时按支持处理。
 
 > GPU 适配：进入 `llama/` 目录时，`.envrc` 按 `GPU_PROFILE`（或 `nvidia-smi` 自动探测）
 > 加载 `.env.g4` / `.env.t4`（如 G4 → `LLAMA_QUANT=UD-Q2_K_XL`、T4 → `UD-IQ1_M` 等）。

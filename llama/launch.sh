@@ -25,6 +25,8 @@
 #   LLAMA_HOST / LLAMA_PORT   监听地址与端口(内部变量 HOST/PORT, 默认 0.0.0.0 / 30000)
 #   LLAMA_API_KEY     服务器 API 密钥(未设置时回退 API_KEY)
 #   LLAMA_XET         1=启用 HF Xet 存储(默认), 0=禁用
+#   LLAMA_MMPROJ      视觉投影器 mmproj 路径(可选; 缺省自动检测模型目录 mmproj-*.gguf, 再按需自动下载)
+#   LLAMA_MMPROJ_REPO mmproj 自动下载源(默认同 LLAMA_MODEL_REPO; 空=禁用自动下载)
 # ============================================================
 
 if [[ -n "${DEBUG:-}" ]]; then
@@ -73,9 +75,14 @@ readonly LLAMA_SERVER
 readonly PORT="${LLAMA_PORT:-30000}"
 readonly HOST="${LLAMA_HOST:-0.0.0.0}"
 readonly LLAMA_NGL="${LLAMA_NGL:-999}"
-readonly LLAMA_CTX="${LLAMA_CTX:-4096}"
+readonly LLAMA_CTX="${LLAMA_CTX:-0}"
 readonly LLAMA_API_KEY="${LLAMA_API_KEY:-${API_KEY:-}}"
 readonly LLAMA_XET="${LLAMA_XET:-1}"   # 1=启用 HuggingFace Xet 存储(默认), 0=禁用
+# 多模态视觉投影器(mmproj): 用于图片/视频输入(可选, 缺省不启用)
+#   LLAMA_MMPROJ       显式指定 mmproj 文件路径(优先级最高; 不设置时自动在模型目录检测 mmproj-*.gguf)
+#   LLAMA_MMPROJ_REPO  自动下载源(默认同 LLAMA_MODEL_REPO; 设为空字符串则禁用自动下载)
+readonly LLAMA_MMPROJ="${LLAMA_MMPROJ:-}"
+readonly LLAMA_MMPROJ_REPO="${LLAMA_MMPROJ_REPO:-${LLAMA_MODEL_REPO:-}}"
 
 # 服务托管(与 sglang/launch.sh 一致): setsid 后台 + PID/日志文件
 # 日志统一写到项目根目录的 logs/(无论从根目录还是 llama/ 下执行, 均落同一处)
@@ -169,6 +176,82 @@ resolve_model_file() {
   printf '%s' "$MODEL_FILE"
 }
 
+# 判断主模型 GGUF 是否声明多模态支持(存在图像 token / 视觉相关元数据键)。
+# 返回 0=支持视觉, 1=不支持。
+# llama-gguf 不可用时无法检测, 按"支持"处理(保持向后兼容, 不因检测而误伤)。
+model_supports_vision() {
+  local mf="$1"
+  local gguf_tool=""
+  if [[ -n "$LLAMA_SERVER" ]]; then
+    gguf_tool="${LLAMA_SERVER%/*}/llama-gguf"
+    [[ -x "$gguf_tool" ]] || gguf_tool="$(command -v llama-gguf 2>/dev/null || true)"
+  else
+    gguf_tool="$(command -v llama-gguf 2>/dev/null || true)"
+  fi
+  if [[ -z "$gguf_tool" || ! -x "$gguf_tool" ]]; then
+    echo "警告: 未找到 llama-gguf, 跳过模型视觉能力检测(按支持视觉处理)。" >&2
+    return 0
+  fi
+  # 注意: 不用 grep -q(匹配即关闭管道, 会让 llama-gguf 收到 SIGPIPE,
+  # pipefail 下管道退出码变 141, 导致误判"不支持视觉"); 用 grep -c 读完全部输出
+  if "$gguf_tool" "$mf" r n 2>/dev/null | grep -ciE 'image_token_id|has_vision|\.vision\.' >/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+# 定位多模态视觉投影器(mmproj)。优先级: 显式 LLAMA_MMPROJ > 模型目录自动检测 > 自动下载。
+# 仅在主模型声明支持视觉时启用(见 model_supports_vision); 否则直接跳过, 避免把不相干的
+# mmproj 传给纯文本模型导致启动/请求失败。
+# 未找到时输出空字符串(不报错): 文本服务照常可用, 仅图片/视频输入不可用。
+# 仅当显式指定的 LLAMA_MMPROJ 路径不存在时返回非零(启动失败)。
+resolve_mmproj_file() {
+  local model_file="$1"
+
+  # 0) 主模型不支持视觉 -> 直接禁用 mmproj
+  if ! model_supports_vision "$model_file"; then
+    echo ">> 主模型不支持视觉(无 image_token/视觉元数据), 跳过 mmproj。" >&2
+    return 0
+  fi
+
+  # 1) 显式指定
+  if [[ -n "$LLAMA_MMPROJ" ]]; then
+    if [[ ! -f "$LLAMA_MMPROJ" ]]; then
+      echo "ERROR: 指定的 LLAMA_MMPROJ 不存在: $LLAMA_MMPROJ" >&2
+      return 1
+    fi
+    printf '%s' "$LLAMA_MMPROJ"
+    return 0
+  fi
+
+  local mm=""
+  # 2) 模型目录自动检测
+  mm=$(find "$LLAMA_MODEL_DIR" -maxdepth 1 -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)
+  if [[ -n "$mm" ]]; then
+    printf '%s' "$mm"
+    return 0
+  fi
+
+  # 3) 自动下载(未显式禁用; 失败仅告警, 不中断启动)
+  if [[ -n "$LLAMA_MMPROJ_REPO" ]]; then
+    echo ">> 未找到本地 mmproj, 开始下载 $LLAMA_MMPROJ_REPO (mmproj-*.gguf) ..." >&2
+    if [[ "$LLAMA_XET" == "1" ]]; then
+      HF_HUB_ENABLE_XET=1 HF_TOKEN="$HF_TOKEN" \
+        hf download "$LLAMA_MMPROJ_REPO" --include 'mmproj-*.gguf' --local-dir "$LLAMA_MODEL_DIR" >/dev/null 2>&1 || true
+    else
+      HF_TOKEN="$HF_TOKEN" \
+        hf download "$LLAMA_MMPROJ_REPO" --include 'mmproj-*.gguf' --local-dir "$LLAMA_MODEL_DIR" >/dev/null 2>&1 || true
+    fi
+    mm=$(find "$LLAMA_MODEL_DIR" -maxdepth 1 -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)
+    if [[ -n "$mm" ]]; then
+      printf '%s' "$mm"
+      return 0
+    fi
+    echo "警告: mmproj 下载失败或未找到, 图片输入不可用(文本功能不受影响)。" >&2
+  fi
+  return 0
+}
+
 do_start() {
   if is_running; then
     echo "服务已在运行 (PID $(cat "$PID_FILE")), 如需重启请执行: $0 restart"
@@ -196,6 +279,9 @@ do_start() {
   check_deps
   local MODEL_FILE
   MODEL_FILE="$(resolve_model_file)"
+  # 视觉投影器(可选): 解析后若非空则服务支持图片/视频输入
+  local MMPROJ_FILE
+  MMPROJ_FILE="$(resolve_mmproj_file "$MODEL_FILE")"
 
   mkdir -p "$LOG_DIR"
 
@@ -216,10 +302,18 @@ do_start() {
     --host "$HOST"
     --port "$PORT"
     --ctx-size "$LLAMA_CTX")
+  if [[ -n "$MMPROJ_FILE" ]]; then
+    LAUNCH_CMD+=(--mmproj "$MMPROJ_FILE")
+  fi
   LAUNCH_CMD+=("${SERVER_ARGS[@]}")
 
   echo "启动 llama 服务... (日志: ${LOG_FILE})" | tee -a "$LOG_FILE"
   echo ">> 加载模型: $MODEL_FILE" | tee -a "$LOG_FILE"
+  if [[ -n "$MMPROJ_FILE" ]]; then
+    echo ">> 视觉投影器(mmproj): $MMPROJ_FILE (图片输入已启用)" | tee -a "$LOG_FILE"
+  else
+    echo ">> 未加载 mmproj: 图片/视频输入不可用(文本功能正常)" | tee -a "$LOG_FILE"
+  fi
   echo ">> 启动命令: ${LAUNCH_CMD[*]}" | tee -a "$LOG_FILE"
 
   # 启动命令单独追加写入命令日志(带时间戳), 便于事后查看实际启动参数

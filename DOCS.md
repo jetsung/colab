@@ -366,7 +366,7 @@ SGLANG_API_KEY='sk-你的密钥' ./launch.sh start
 | `--attention-backend` | `flashinfer` | 默认注意力后端 |
 | `--kv-cache-dtype` | `fp8_e4m3` | KV 量化为 8bit，KV 容量翻倍（省显存，适合 G4/T4） |
 | `--chunked-prefill-size` | `2048` | prefill 分块，降低长输入首 token 延迟抖动 |
-| `--context-length` | 模型 `max_position_embeddings`（默认） | **自动推导**；可用 `SGLANG_CONTEXT_LENGTH` 覆盖；KV 池按剩余显存分配，不预占 |
+| `--context-length` | 模型 `max_position_embeddings`（默认） | **自动推导**；可用 `SGLANG_CTX` 覆盖（默认 0=自动）；KV 池按剩余显存分配，不预占 |
 | `--mem-fraction-static` | `0.90` | 静态显存占比。**G4/T4 OOM 时降到 0.85 试探**（由 `SGLANG_MEM_FRACTION_STATIC` 控制；`.env.g4`/`.env.t4` 提供 0.85/0.80） |
 | `--reasoning-parser` | 按家族推导 | **自动推导**（qwen→`qwen3`、deepseek→`deepseek_v3`、glm→`glm45`）；可用 `SGLANG_REASONING_PARSER` 覆盖 |
 | `--tool-call-parser` | 按家族推导 | **自动推导**（qwen→`qwen3_coder` 等）；可用 `SGLANG_TOOL_CALL_PARSER` 覆盖 |
@@ -389,7 +389,7 @@ SGLANG_API_KEY='sk-你的密钥' ./launch.sh start
 | `--served-model-name` | 默认=模型路径末段（小写、`/`→`-`） | `SGLANG_SERVED_NAME` |
 | `--reasoning-parser` / `--tool-call-parser` | 按 `architectures`/`model_type` 家族 | `SGLANG_REASONING_PARSER` / `SGLANG_TOOL_CALL_PARSER` |
 | `--default-chat-template-kwargs` | qwen 家族默认 `{"enable_thinking": true}` | `SGLANG_CHAT_TEMPLATE_KWARGS` |
-| `--context-length` | 读取 `max_position_embeddings` | `SGLANG_CONTEXT_LENGTH` |
+| `--context-length` | 读取 `max_position_embeddings` | `SGLANG_CTX`（默认 0=自动） |
 | `--mamba-*` 三参数 | 仅当模型为 mamba/SSM 类时注入 | — |
 | `--speculative-algorithm EAGLE` | 仅当 config 含 MTP 层时注入 | `SGLANG_SPECULATIVE_ALGORITHM` |
 | `--max-running-requests` | 仅当启用投机解码时注入，默认 48 | `SGLANG_MAX_RUNNING_REQUESTS` |
@@ -524,5 +524,5 @@ FlashInfer 首次 JIT 编译内核（几分钟，之后有缓存）；llama.cpp 
 
 **Q12: 上下文不够长？**
 - llama.cpp：增大 `--ctx-size`（显存有限，配合 YARN/rope-scaling 可外推）；
-- SGLang：`--context-length` 按模型自动推导，可用 `SGLANG_CONTEXT_LENGTH` 覆盖；
+- SGLang：`--context-length` 按模型自动推导，可用 `SGLANG_CTX` 覆盖（默认 0=自动）；
   但上下文越长 KV 越占显存，需在显存范围内权衡。

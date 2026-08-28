@@ -14,8 +14,8 @@ export SGLANG_FLASHINFER_CUDA_ARCH_LIST=8.9f
 # 显存较小：降低静态显存占比防 OOM
 export SGLANG_MEM_FRACTION_STATIC=0.85
 
-# 显存有限：收敛上下文（按需调整）
-export SGLANG_CONTEXT_LENGTH=16384
+# 上下文: SGLANG_CTX=0 由 config.json 自动推导(按需调整)
+export SGLANG_CTX=0
 
 # 显存小时换更小模型（按需调整；不设置则用 .envrc/.env 的 SGLANG_MODEL_REPO / MODEL_REPO）
 # export SGLANG_MODEL_REPO=Qwen/Qwen3-8B

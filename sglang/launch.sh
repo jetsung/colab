@@ -20,7 +20,7 @@
 #   SGLANG_MODEL_REPO    模型(HF ID 或本地路径); 未设置时回退 MODEL_REPO
 #   SGLANG_SERVED_NAME   API 模型别名(默认取模型路径末段小写)
 #   SGLANG_HOST / SGLANG_PORT   监听地址与端口(默认 0.0.0.0 / 30000)
-#   SGLANG_CONTEXT_LENGTH    最大上下文(默认空=由 config.json 推导)
+#   SGLANG_CTX    最大上下文(默认0=由 config.json 推导)
 #   SGLANG_SPECULATIVE_ALGORITHM    投机解码算法(默认按 MTP 层自动判断; 置空=关闭)
 #   SGLANG_SPECULATIVE_NUM_STEPS / SGLANG_SPECULATIVE_EAGLE_TOPK / SGLANG_SPECULATIVE_NUM_DRAFT_TOKENS
 #   SGLANG_MAX_RUNNING_REQUESTS    投机解码时最大并发请求数(默认 48)
@@ -66,8 +66,8 @@ readonly PORT="${SGLANG_PORT:-30000}"
 # API 鉴权密钥: 优先 SGLANG_API_KEY, 回退通用 API_KEY(由 .envrc/.env 加载), 脚本不内置任何密钥
 # 未设置时 start 报错退出; 显式置空(SGLANG_API_KEY="")则关闭鉴权
 readonly SGLANG_API_KEY="${SGLANG_API_KEY:-${API_KEY:-}}"
-# 最大上下文: 默认空=由模型 config.json 的 max_position_embeddings 推导, 可用 SGLANG_CONTEXT_LENGTH 覆盖
-readonly CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-}"
+# 最大上下文: 默认0=由模型 config.json 的 max_position_embeddings 推导, 可用 SGLANG_CTX 覆盖
+readonly CONTEXT_LENGTH="${SGLANG_CTX:-0}"
 # 投机解码: 启动时按模型 config.json 是否内置 MTP 层自动判断 EAGLE 支持(见 detect_speculative_algorithm)
 # 可用环境变量 SGLANG_SPECULATIVE_ALGORITHM 显式覆盖(置空=关闭)
 readonly SPECULATIVE_NUM_STEPS="${SGLANG_SPECULATIVE_NUM_STEPS:-3}"
@@ -334,9 +334,9 @@ do_start() {
     esac
   fi
 
-  # 上下文长度: 优先环境变量, 否则从 config 推导
+  # 上下文长度: 优先环境变量(0 视为自动), 否则从 config 推导
   CTX="$CONTEXT_LENGTH"
-  if [[ -z "$CTX" ]]; then
+  if [[ -z "$CTX" || "$CTX" == "0" ]]; then
     CTX="$(detect_context_length "$MODEL_CONFIG")"
   fi
 
@@ -379,7 +379,7 @@ do_start() {
   if [[ -n "${SGLANG_API_KEY}" ]]; then
     args+=(--api-key "${SGLANG_API_KEY}")
   fi
-  # CONTEXT_LENGTH / 推导值非空时才注入 --context-length, 否则交给模型默认
+  # SGLANG_CTX(0=自动推导)/ 推导值非空时才注入 --context-length, 否则交给模型默认
   if [[ -n "$CTX" ]]; then
     args+=(--context-length "$CTX")
   fi

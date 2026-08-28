@@ -1,5 +1,5 @@
 # ============================================================
-# GPU profile: G4 (NVIDIA Ada, sm_89, 显存较小)
+# GPU profile: G4 (Blackwell, 显存充足)
 # llama.cpp 引擎专用（llama/ 目录）
 #
 # 用法:
@@ -11,9 +11,9 @@
 # llama.cpp 编译目标架构（install.sh 使用）
 export LLAMA_CUDA_ARCH=89
 
-# 显存有限：更小量化 + 更小上下文（按需调整）
+# 显存充足(96GB Blackwell): LLAMA_CTX=0 由 llama.cpp 按空闲显存自动拟合上下文
 export LLAMA_QUANT=UD-Q4_K_XL
-export LLAMA_CTX=4096
+export LLAMA_CTX=0
 export LLAMA_NGL=999
 
 export LLAMA_MODEL_REPO=unsloth/Qwen3.8-Flash-Next-GGUF
