@@ -25,6 +25,7 @@
 #   LLAMA_HOST / LLAMA_PORT   监听地址与端口(内部变量 HOST/PORT, 默认 0.0.0.0 / 30000)
 #   LLAMA_API_KEY     服务器 API 密钥(未设置时回退 API_KEY)
 #   LLAMA_XET         1=启用 HF Xet 存储(默认), 0=禁用
+#   LLAMA_VISION      auto=按模型能力自动检测, 1=强制尝试启用, 0=禁用(默认 0)
 #   LLAMA_MMPROJ      视觉投影器 mmproj 路径(可选; 缺省自动检测模型目录 mmproj-*.gguf, 再按需自动下载)
 #   LLAMA_MMPROJ_REPO mmproj 自动下载源(默认同 LLAMA_MODEL_REPO; 空=禁用自动下载)
 # ============================================================
@@ -82,8 +83,10 @@ readonly LLAMA_CTX="${LLAMA_CTX:-0}"
 readonly LLAMA_API_KEY="${LLAMA_API_KEY:-${API_KEY:-}}"
 readonly LLAMA_XET="${LLAMA_XET:-1}"   # 1=启用 HuggingFace Xet 存储(默认), 0=禁用
 # 多模态视觉投影器(mmproj): 用于图片/视频输入(可选, 缺省不启用)
+#   LLAMA_VISION      auto=按模型能力自动检测, 1=跳过检测并尝试启用, 0=完全禁用
 #   LLAMA_MMPROJ       显式指定 mmproj 文件路径(优先级最高; 不设置时自动在模型目录检测 mmproj-*.gguf)
 #   LLAMA_MMPROJ_REPO  自动下载源(默认同 LLAMA_MODEL_REPO; 设为空字符串则禁用自动下载)
+readonly LLAMA_VISION="${LLAMA_VISION:-0}"
 readonly LLAMA_MMPROJ="${LLAMA_MMPROJ:-}"
 readonly LLAMA_MMPROJ_REPO="${LLAMA_MMPROJ_REPO:-${LLAMA_MODEL_REPO:-}}"
 
@@ -206,18 +209,29 @@ model_supports_vision() {
 }
 
 # 定位多模态视觉投影器(mmproj)。优先级: 显式 LLAMA_MMPROJ > 模型目录自动检测 > 自动下载。
-# 仅在主模型声明支持视觉时启用(见 model_supports_vision); 否则直接跳过, 避免把不相干的
-# mmproj 传给纯文本模型导致启动/请求失败。
+# LLAMA_VISION=auto 时仅在主模型声明支持视觉时启用(见 model_supports_vision),
+# 避免把不相干的 mmproj 传给纯文本模型导致启动/请求失败。
+# LLAMA_VISION=1 跳过能力检测并尝试启用; LLAMA_VISION=0 直接禁用 mmproj。
 # 未找到时输出空字符串(不报错): 文本服务照常可用, 仅图片/视频输入不可用。
-# 仅当显式指定的 LLAMA_MMPROJ 路径不存在时返回非零(启动失败)。
+# 仅当显式指定的 LLAMA_MMPROJ 路径不存在时返回非零(启动失败; LLAMA_VISION=0 除外)。
 resolve_mmproj_file() {
   local model_file="$1"
 
-  # 0) 主模型不支持视觉 -> 直接禁用 mmproj
-  if ! model_supports_vision "$model_file"; then
-    echo ">> 主模型不支持视觉(无 image_token/视觉元数据), 跳过 mmproj。" >&2
-    return 0
-  fi
+  case "$LLAMA_VISION" in
+    0)
+      echo ">> LLAMA_VISION=0, 禁用视觉支持, 跳过 mmproj。" >&2
+      return 0
+      ;;
+    auto)
+      if ! model_supports_vision "$model_file"; then
+        echo ">> 主模型不支持视觉(无 image_token/视觉元数据), 跳过 mmproj。" >&2
+        return 0
+      fi
+      ;;
+    1)
+      echo ">> LLAMA_VISION=1, 跳过模型视觉能力检测, 尝试启用 mmproj。" >&2
+      ;;
+  esac
 
   # 1) 显式指定
   if [[ -n "$LLAMA_MMPROJ" ]]; then
@@ -280,6 +294,13 @@ do_start() {
     echo "ERROR: LLAMA_QUANT 不可为空。请显式设置(如 LLAMA_QUANT=UD-Q4_K_XL, 或由 gpu profile/.envrc 提供)。" >&2
     exit 1
   fi
+  case "$LLAMA_VISION" in
+    auto|1|0) ;;
+    *)
+      echo "ERROR: LLAMA_VISION 必须是 auto、1 或 0，当前值: $LLAMA_VISION" >&2
+      exit 1
+      ;;
+  esac
 
   check_deps
   local MODEL_FILE
