@@ -298,20 +298,23 @@ env -u UV_SYSTEM_PYTHON uv pip install --prerelease=allow sglang
 RuntimeError: FlashInfer requires GPUs with sm75 or higher
 ```
 
-根因：FlashInfer 查询 CUDA 版本时优先调用系统 nvcc，导致架构列表为空，
+根因：FlashInfer 查询 CUDA 版本时优先调用系统 nvcc。Blackwell（SM 12.x）需要
+CUDA ≥ 12.9 才能归一化出 `12.0f`，系统 nvcc 更旧（如 12.8）时架构集合被置空，
 JIT 编译器误判为"显卡太旧"。
 
-**修复**：显式指定架构。G4（Ada，sm_89）用 `8.9f`，T4（Turing，sm_75）用 `7.5f`：
+**修复**：`launch.sh` 已内置处理，核心是导出 FlashInfer 真正读取的变量（无 `SGLANG_` 前缀），
+并按 `nvidia-smi` 的 compute_cap + nvcc 版本推导架构后缀（带后缀的值会被原样采用，跳过版本检查）：
 
 ```bash
-export SGLANG_FLASHINFER_CUDA_ARCH_LIST="8.9f"   # G4 (Ada)
-# 或
-export SGLANG_FLASHINFER_CUDA_ARCH_LIST="7.5f"   # T4 (Turing)
+export FLASHINFER_CUDA_ARCH_LIST="12.0f"   # Blackwell SM 12.0 且 nvcc >= 12.9
+export FLASHINFER_CUDA_ARCH_LIST="12.0a"   # Blackwell SM 12.0 但 nvcc < 12.9（如系统 CUDA 12.8）
+# export FLASHINFER_CUDA_ARCH_LIST="8.9"    # G4 (Ada, sm_89, 无后缀)
+# export FLASHINFER_CUDA_ARCH_LIST="7.5"    # T4 (Turing, sm_75, 无后缀)
 ```
 
-> 若不确定型号，可用 `nvidia-smi` 或 torch 打印的 `get_device_capability` 查询，
-> 再对号填入对应 `SGLANG_FLASHINFER_CUDA_ARCH_LIST`。
-> 进入 `sglang/` 目录时，`.envrc` 会自动按 GPU 加载 `.env.g4` / `.env.t4`（已含该变量），一般无需手动设置。
+> 一般无需手动设置：脚本按 `nvidia-smi` 自动推导，并在启动日志打印实际取值。
+> 不要为凑 `12.0f` 把 `CUDA_HOME` 指到 venv 的 cuda 包 —— 其头文件（CUDART 13.0）与自带
+> nvcc（13.4）版本不一致，cccl 会 `#error` 拒绝编译；用系统 CUDA 12.8 + `12.0a` 即可正常 JIT。
 
 ---
 
@@ -333,6 +336,13 @@ cd sglang
 
 ```bash
 ./colab.sh install sglang
+```
+
+并发压测（根目录 `bench.py`，sglang / llama.cpp 通用；参数透传）：
+
+```bash
+./colab.sh sglang bench -n 32 --max-tokens 256
+make sglang-bench BENCH_ARGS="-n 32 --max-tokens 256"
 ```
 
 脚本为**通用模型**设计：served 模型名、推理/工具调用解析器、chat template、
@@ -485,8 +495,8 @@ nvidia-smi                               # 显存占用
 
 **Q1: Colab GPU 到底是 G4 还是 T4？**
 型号不固定，用 `nvidia-smi` 或 `python -c "import torch;print(torch.cuda.get_device_name(0))"`
-查询。不同型号架构不同（G4=Ada sm_89、T4=Turing sm_75），影响 `SGLANG_FLASHINFER_CUDA_ARCH_LIST`
-与 llama.cpp 的 `-DCMAKE_CUDA_ARCHITECTURES` 取值。
+查询。不同型号架构不同（G4=Ada sm_89、T4=Turing sm_75、Blackwell=sm_120），影响
+`FLASHINFER_CUDA_ARCH_LIST` 与 llama.cpp 的 `-DCMAKE_CUDA_ARCHITECTURES` 取值。
 
 **Q2: llama.cpp 启动报 CUDA 相关错误？**
 确认使用的是 CUDA 源码编译版；执行 `./colab.sh install llama --build`（或用 `-DGGML_CUDA=on` 手动重编）；
@@ -500,7 +510,8 @@ nvidia-smi                               # 显存占用
 显存小/图省事选 llama.cpp；要性能、并发、深度思考/工具调用等完善功能选 SGLang。
 
 **Q5: SGLang 启动报 `FlashInfer requires GPUs with sm75 or higher`？**
-未设置 `SGLANG_FLASHINFER_CUDA_ARCH_LIST`，或填错架构。见 B2 坑二。
+架构没传对，或 nvcc 太旧编不出 `compute_120f`：需 `FLASHINFER_CUDA_ARCH_LIST`（注意无
+`SGLANG_` 前缀）+ CUDA ≥ 12.9 的 nvcc。见 B2 坑二。
 
 **Q6: uv 安装时装到了系统 Python？**
 `UV_SYSTEM_PYTHON=true` 在作怪，用 `env -u UV_SYSTEM_PYTHON` 前缀。见 B2 坑一。

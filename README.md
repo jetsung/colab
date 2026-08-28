@@ -25,6 +25,7 @@ colab/
 ├── DOCS.md                # 完整部署教程：llama.cpp / SGLang 安装与使用、参数、API、FAQ
 ├── Makefile               # 常用操作封装（薄封装 colab.sh）
 ├── colab.sh               # 一体化管理入口：vps / setup / install / bore 子命令
+├── bench.py               # 并发压测：sglang / llama.cpp 通用（吞吐、延迟、并发峰值）
 ├── .envrc / .env          # 环境变量（.env 含密钥，不入 git）
 ├── llama/                 # llama.cpp 引擎（GGUF）
 │   ├── README.md          # 特定模型的 llama.cpp 部署教程（含 PR 需求说明）

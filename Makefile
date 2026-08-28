@@ -6,7 +6,7 @@
 #   [Colab]   setup: deps / bore / relaydrop / opencode / codebuddy / hint / all
 #   [Colab]   install: llama / sglang(安装并启用引擎环境)
 #   [Colab]   llama: start / stop / restart / status / test / logs / keep
-#   [Colab]   sglang: start / stop / restart / status / test / logs / keep
+#   [Colab]   sglang: start / stop / restart / status / test / bench / logs / keep
 #   [Colab]   bore:  start / stop / restart / status / logs
 #
 # 实际逻辑见 colab.sh, 此处仅配置参数透传
@@ -31,8 +31,8 @@ BORE_PORT ?= 65535
         setup setup-deps setup-tools setup-bore setup-relaydrop \
         setup-opencode setup-codebuddy setup-hint \
         install-llama install-llama-build install-sglang \
-        llama llama-start llama-stop llama-restart llama-status llama-test llama-logs llama-keep \
-        sglang sglang-start sglang-stop sglang-restart sglang-status sglang-test sglang-logs sglang-keep \
+        llama llama-start llama-stop llama-restart llama-status llama-test llama-bench llama-logs llama-keep \
+        sglang sglang-start sglang-stop sglang-restart sglang-status sglang-test sglang-bench sglang-logs sglang-keep \
         bore bore-start bore-stop bore-restart bore-status bore-logs \
         help list
 
@@ -165,6 +165,10 @@ llama-status:
 llama-test:
 	bash $(SCRIPT) llama test
 
+## [Colab/llama] llama-bench: 并发压测(参数用 BENCH_ARGS 传, 如 -n 8 --max-tokens 256)
+llama-bench:
+	bash $(SCRIPT) llama bench $(BENCH_ARGS)
+
 ## [Colab/llama] llama-logs: 跟踪日志
 llama-logs:
 	bash $(SCRIPT) llama logs
@@ -197,6 +201,10 @@ sglang-status:
 ## [Colab/sglang] sglang-test: 发送一条测试对话(需服务已就绪)
 sglang-test:
 	bash $(SCRIPT) sglang test
+
+## [Colab/sglang] sglang-bench: 并发压测(参数用 BENCH_ARGS 传, 如 -n 64 --max-tokens 512)
+sglang-bench:
+	bash $(SCRIPT) sglang bench $(BENCH_ARGS)
 
 ## [Colab/sglang] sglang-logs: 跟踪日志
 sglang-logs:

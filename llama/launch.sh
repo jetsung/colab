@@ -25,6 +25,7 @@
 #   LLAMA_HOST / LLAMA_PORT   监听地址与端口(内部变量 HOST/PORT, 默认 0.0.0.0 / 30000)
 #   LLAMA_API_KEY     服务器 API 密钥(未设置时回退 API_KEY)
 #   LLAMA_XET         1=启用 HF Xet 存储(默认), 0=禁用
+#   LLAMA_METRICS     1=开放 /metrics 端点(默认, 供根目录 bench.py 采样并发), 0=禁用
 #   LLAMA_VISION      auto=按模型能力自动检测, 1=强制尝试启用, 0=禁用(默认 0)
 #   LLAMA_MMPROJ      视觉投影器 mmproj 路径(可选; 缺省自动检测模型目录 mmproj-*.gguf, 再按需自动下载)
 #   LLAMA_MMPROJ_REPO mmproj 自动下载源(默认同 LLAMA_MODEL_REPO; 空=禁用自动下载)
@@ -82,6 +83,8 @@ readonly LLAMA_NGL="${LLAMA_NGL:-999}"
 readonly LLAMA_CTX="${LLAMA_CTX:-0}"
 readonly LLAMA_API_KEY="${LLAMA_API_KEY:-${API_KEY:-}}"
 readonly LLAMA_XET="${LLAMA_XET:-1}"   # 1=启用 HuggingFace Xet 存储(默认), 0=禁用
+# Prometheus 指标端点 /metrics: 1=启用(默认, 供根目录 bench.py 采样并发), 0=禁用
+readonly LLAMA_METRICS="${LLAMA_METRICS:-1}"
 # 多模态视觉投影器(mmproj): 用于图片/视频输入(可选, 缺省不启用)
 #   LLAMA_VISION      auto=按模型能力自动检测, 1=跳过检测并尝试启用, 0=完全禁用
 #   LLAMA_MMPROJ       显式指定 mmproj 文件路径(优先级最高; 不设置时自动在模型目录检测 mmproj-*.gguf)
@@ -330,6 +333,11 @@ do_start() {
     --ctx-size "$LLAMA_CTX")
   if [[ -n "$MMPROJ_FILE" ]]; then
     LAUNCH_CMD+=(--mmproj "$MMPROJ_FILE")
+  fi
+  # /metrics: 默认开启, 供根目录 bench.py 采样 requests_processing / requests_deferred
+  # (llama-server 默认不开放该端点); LLAMA_METRICS=0 可关闭
+  if [[ "$LLAMA_METRICS" == "1" ]]; then
+    LAUNCH_CMD+=(--metrics)
   fi
   LAUNCH_CMD+=("${SERVER_ARGS[@]}")
 

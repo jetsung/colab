@@ -7,8 +7,8 @@
 #   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
 #   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
 #   install <engine> [--build|-B]       Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
-#   llama start|stop|restart|status|test|logs|keep   Colab 内: llama.cpp 服务管理(透传 llama/launch.sh)
-#   sglang start|stop|restart|status|test|logs|keep  Colab 内: SGLang 服务管理(透传 sglang/launch.sh)
+#   llama start|stop|restart|status|test|bench|logs|keep   Colab 内: llama.cpp 服务管理(透传 llama/launch.sh)
+#   sglang start|stop|restart|status|test|bench|logs|keep  Colab 内: SGLang 服务管理(透传 sglang/launch.sh)
 #   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
 #
 # 全局:
@@ -38,8 +38,8 @@ usage_root() {
   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
   install <engine> [--build|-B]          Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
-  llama start|stop|restart|status|test|logs|keep   Colab 内: llama.cpp 服务管理(动作见 llama -h)
-  sglang start|stop|restart|status|test|logs|keep  Colab 内: SGLang 服务管理(动作见 sglang -h)
+  llama start|stop|restart|status|test|bench|logs|keep   Colab 内: llama.cpp 服务管理(动作见 llama -h)
+  sglang start|stop|restart|status|test|bench|logs|keep  Colab 内: SGLang 服务管理(动作见 sglang -h)
   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
   help | -h | --help                    查看本帮助
 
@@ -61,6 +61,7 @@ usage_engine() {
   restart   重启服务
   status    查看状态 + 健康检查
   test      发送一条测试对话(需服务已就绪)
+  bench     并发压测(根目录 bench.py; 额外参数透传, 如 -n 32 --max-tokens 256)
   logs      跟踪日志
   keep      守护模式(崩溃自动拉起)
   help      显示本帮助
@@ -630,8 +631,24 @@ do_engine() {
         exec "$script" "$action" "${@:2}"
       fi
       ;;
+    bench)
+      # 并发压测: 走根目录 bench.py(--engine 由本函数按引擎注入, 后续参数可覆盖)
+      # 同样经 direnv 加载环境, 以便读到 *_API_KEY
+      # PYTHONDONTWRITEBYTECODE: 一次性脚本无需字节码缓存, 避免项目里留下 __pycache__
+      # (等价 python3 -B; 想改到 /tmp 则用 PYTHONPYCACHEPREFIX=/tmp/pycache)
+      export PYTHONDONTWRITEBYTECODE=1
+      shift
+      if command -v direnv >/dev/null 2>&1; then
+        direnv allow "$dir" >/dev/null 2>&1 || true
+        direnv allow "$SCRIPT_DIR" >/dev/null 2>&1 || true
+        exec direnv exec "$dir" python3 "${SCRIPT_DIR}/bench.py" --engine "$engine" "$@"
+      else
+        echo "警告: 未检测到 direnv, 鉴权密钥需已手动设置" >&2
+        exec python3 "${SCRIPT_DIR}/bench.py" --engine "$engine" "$@"
+      fi
+      ;;
     *)
-      echo "错误: 未知动作 '$action' (可选: start | stop | restart | status | logs | keep)" >&2
+      echo "错误: 未知动作 '$action' (可选: start | stop | restart | status | test | bench | logs | keep)" >&2
       usage_engine "$engine"
       exit 1
       ;;

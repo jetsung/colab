@@ -100,6 +100,7 @@ cd llama
 | `LLAMA_CTX` / `LLAMA_NGL` | `0` / `999` | 上下文长度（0=自动按空闲显存拟合）/ GPU 层数 |
 | `LLAMA_API_KEY` | 回退 `API_KEY` | 服务器 API 鉴权密钥 |
 | `LLAMA_XET` | `1` | 1=启用 HF Xet 存储（默认），0=禁用 |
+| `LLAMA_METRICS` | `1` | 1=开放 `/metrics` 端点（默认，供根目录 `bench.py` 采样并发），0=禁用 |
 | `LLAMA_VISION` | `0` | `auto`=按模型能力自动检测，`1`=跳过检测并尝试启用，`0`=完全禁用视觉 |
 | `LLAMA_MMPROJ` | 自动检测 `模型目录/mmproj-*.gguf` | 视觉投影器路径（图片输入）；缺省自动下载 `mmproj-*.gguf` |
 | `LLAMA_MMPROJ_REPO` | 同 `LLAMA_MODEL_REPO` | mmproj 自动下载源；设为空串禁用自动下载 |
@@ -135,6 +136,20 @@ curl http://localhost:30000/v1/chat/completions \
     "temperature": 0.7
   }'
 ```
+
+并发压测：用项目根目录的 [bench.py](../bench.py)（自动识别 llama.cpp 的
+`requests_processing` / `requests_deferred` 指标，需 `LLAMA_METRICS=1`，即默认开启）：
+
+```bash
+cd /content/colab
+./bench.py --engine llama -n 8 --max-tokens 256
+
+# 等价入口(自动经 direnv 加载密钥)
+./colab.sh llama bench -n 8 --max-tokens 256
+make llama-bench BENCH_ARGS="-n 8 --max-tokens 256"
+```
+
+> 两个引擎默认端口同为 30000，压测前确认跑的是哪个服务（或改 `LLAMA_PORT`）。
 
 ---
 

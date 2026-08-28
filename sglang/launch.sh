@@ -24,8 +24,12 @@
 #   SGLANG_SPECULATIVE_ALGORITHM    投机解码算法(默认按 MTP 层自动判断; 置空=关闭)
 #   SGLANG_SPECULATIVE_NUM_STEPS / SGLANG_SPECULATIVE_EAGLE_TOPK / SGLANG_SPECULATIVE_NUM_DRAFT_TOKENS
 #   SGLANG_MAX_RUNNING_REQUESTS    投机解码时最大并发请求数(默认 48)
+#   SGLANG_MAMBA_FULL_MEMORY_RATIO mamba 状态缓存占比(默认 0.6); mamba 模型实际并发
+#                                  ≈ max_mamba_cache_size/4, 调大提升并发、缩小 KV 池
 #   SGLANG_MEM_FRACTION_STATIC     静态显存占比(默认 0.90; 由 .env.g4/.env.t4 提供)
-#   SGLANG_FLASHINFER_CUDA_ARCH_LIST   FlashInfer/CUDA 架构(默认按 nvidia-smi 探测)
+#   FLASHINFER_CUDA_ARCH_LIST   FlashInfer JIT 目标架构(默认按 nvidia-smi + nvcc 版本推导,
+#                               如 Blackwell: nvcc>=12.9 -> 12.0f, 否则 12.0a)
+#   CUDA_HOME / CUDA_PATH       JIT 编译用的 CUDA 工具链(影响架构取值; 默认用系统 nvcc)
 #   SGLANG_REASONING_PARSER / SGLANG_TOOL_CALL_PARSER / SGLANG_CHAT_TEMPLATE_KWARGS
 #   SGLANG_API_KEY       鉴权密钥(未设置时回退 API_KEY; 两者均空则报错, 显式置空关闭鉴权)
 # =============================================================================
@@ -78,27 +82,65 @@ readonly SPECULATIVE_NUM_DRAFT_TOKENS="${SGLANG_SPECULATIVE_NUM_DRAFT_TOKENS:-4}
 readonly MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-48}"
 # 静态显存占比(KV池等): 优先 SGLANG_MEM_FRACTION_STATIC, 可由 .env.g4/.env.t4 提供
 readonly MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.90}"
-readonly MAMBA_FULL_MEMORY_RATIO=0.2                          # mamba 缓存比例; 调大可提高并发
+# mamba 状态缓存占比(相对 KV 池): 直接决定 mamba 模型的并发上限 ——
+# max_running_requests ≈ max_mamba_cache_size / 4(投机解码下每请求 4 个 state slot)。
+# 0.2 时仅 ~29 slot(并发 7); 调大可线性提升并发, 代价是 KV 池变小(长上下文容量下降)。
+readonly MAMBA_FULL_MEMORY_RATIO="${SGLANG_MAMBA_FULL_MEMORY_RATIO:-0.6}"
 readonly CHUNKED_PREFILL_SIZE=2048                            # prefill 分块大小
 # 以下参数默认由模型家族自动推导, 可用同名环境变量显式覆盖(见头部"环境变量"段)
 readonly REASONING_PARSER="${SGLANG_REASONING_PARSER:-}"      # 推理解析器(如 qwen3 / deepseek_v3)
 readonly TOOL_CALL_PARSER="${SGLANG_TOOL_CALL_PARSER:-}"      # 工具调用解析器(如 qwen3_coder)
 readonly CHAT_TEMPLATE_KWARGS="${SGLANG_CHAT_TEMPLATE_KWARGS:-}"  # chat template 参数(JSON, 如 {"enable_thinking":true})
 
-# 关键修复: FlashInfer 会误读系统 nvcc 版本导致架构检测失败,
-# 显式指定架构(带 f 后缀可跳过 CUDA 版本检查)。
-# 默认 sglang 官方 Blackwell (12.0f); 由 profile/G4(8.9f)/T4(7.5f) 或环境变量覆盖
-# (见 .env.g4 / .env.t4), 未设置即回退自动探测 nvidia-smi
-if [[ -z "${SGLANG_FLASHINFER_CUDA_ARCH_LIST:-}" ]]; then
+# ------------------------ FlashInfer / CUDA 架构 ------------------------------
+# 坑: FlashInfer 读的是 FLASHINFER_CUDA_ARCH_LIST(无 SGLANG_ 前缀), 且其
+# CompilationContext 在 import 时即构造, 只能从进程环境继承 —— 必须由本脚本在
+# 启动前 export。
+# 自动探测时, SM 12.x(Blackwell)要求 CUDA >= 12.9 才能归一化出 12.0f; nvcc 更旧
+# (如系统 CUDA 12.8)则抛 "SM 12.x requires CUDA >= 12.9" -> 架构集合为空 -> JIT
+# 报 "FlashInfer requires GPUs with sm75 or higher"。
+# 带后缀的值会被 FlashInfer 原样采用, 从而跳过该版本检查, 故这里按 nvcc 版本选:
+#   SM 12.0 + nvcc >= 12.9 -> 12.0f; nvcc < 12.9 -> 12.0a(sm_120a, 与 flashinfer
+#   自身对 CUDA<12.9 的回退一致, 见 jit/nvfp4_attention_sm120.py)。
+# 注意: 不要为凑 12.0f 改指 CUDA_HOME 到 venv 的 cuda 包 —— 其头文件(CUDART 13.0)
+# 与自带 nvcc(13.4)版本不一致, cccl 会直接 #error 拒绝编译。
+
+# 输出 nvcc 版本(major.minor); 优先 CUDA_HOME/CUDA_PATH, 否则用 PATH 中的 nvcc
+detect_nvcc_version() {
+  local nvcc
+  nvcc="${CUDA_HOME:-${CUDA_PATH:-}}/bin/nvcc"
+  [[ -x "$nvcc" ]] || nvcc="$(command -v nvcc 2>/dev/null || true)"
+  [[ -n "$nvcc" && -x "$nvcc" ]] || return
+  "$nvcc" --version 2>/dev/null | grep -oE 'release [0-9]+\.[0-9]+' | head -1 | awk '{print $2}'
+}
+
+nvcc_at_least() {  # $1=最低版本; 返回 0 表示满足
+  local v
+  v="$(detect_nvcc_version)"
+  [[ -n "$v" ]] || return 1
+  awk -v v="$v" -v req="$1" 'BEGIN{exit !(v >= req)}'
+}
+
+# 推导架构列表: 后缀规则与 flashinfer/compilation_context.py 一致
+# SM 12.0 -> 12.0f/12.0a; 其它 SM 12.x -> 12.xa; SM 9/10/11 -> xa; SM <= 8 -> 无后缀
+if [[ -z "${FLASHINFER_CUDA_ARCH_LIST:-}" ]]; then
   CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)
   case "$CC" in
-    8.9) export SGLANG_FLASHINFER_CUDA_ARCH_LIST="8.9f" ;;  # G4 (Ada)
-    7.5) export SGLANG_FLASHINFER_CUDA_ARCH_LIST="7.5f" ;;  # T4 (Turing)
-    12.0) export SGLANG_FLASHINFER_CUDA_ARCH_LIST="12.0f" ;; # Blackwell
-    *)   export SGLANG_FLASHINFER_CUDA_ARCH_LIST="12.0f" ;;
+    12.0)                                                   # Blackwell (RTX PRO 6000 / RTX 50)
+      if nvcc_at_least 12.9; then
+        FLASHINFER_CUDA_ARCH_LIST="12.0f"
+      else
+        FLASHINFER_CUDA_ARCH_LIST="12.0a"
+      fi
+      ;;
+    12.*)           FLASHINFER_CUDA_ARCH_LIST="${CC}a" ;;    # 其它 SM 12.x
+    9*|10*|11*)     FLASHINFER_CUDA_ARCH_LIST="${CC}a" ;;    # Hopper 及以后
+    *.*)            FLASHINFER_CUDA_ARCH_LIST="${CC}" ;;     # Ada(8.9) / Turing(7.5) 等无后缀
+    *)              FLASHINFER_CUDA_ARCH_LIST="" ;;          # 探测失败: 交给 FlashInfer 自行探测
   esac
   unset CC
 fi
+export FLASHINFER_CUDA_ARCH_LIST
 
 # pgrep 匹配模式(括号防自匹配): 新入口 `sglang serve`, 兼容旧入口 `python -m sglang.launch_server`
 readonly PROC_PATTERN="sglang [s]erve|launch_[s]erver"
@@ -412,6 +454,7 @@ do_start() {
 
   echo "启动 SGLang 服务... (日志: ${LOG_FILE})" | tee -a "$LOG_FILE"
   echo ">> 模型: $MODEL_PATH" | tee -a "$LOG_FILE"
+  echo ">> FlashInfer 架构: FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-<自动>} (nvcc $(detect_nvcc_version), CUDA_HOME=${CUDA_HOME:-<系统默认>})" | tee -a "$LOG_FILE"
   echo ">> 启动命令: ${LAUNCH_CMD[*]}" | tee -a "$LOG_FILE"
 
   # 启动命令单独追加写入命令日志(带时间戳), 便于事后查看实际启动参数
@@ -441,9 +484,10 @@ do_start() {
 
 do_stop() {
   if ! pgrep_server; then
+    # 用 return 而非 exit: restart 会在 stop 之后继续 start
     echo "服务未在运行"
     rm -f "$PID_FILE"
-    exit 0
+    return 0
   fi
   echo "停止 SGLang 服务..."
   pkill -TERM -f "$PROC_PATTERN" 2>/dev/null || true

@@ -8,8 +8,10 @@
 # 加载后仍可用环境变量临时覆盖
 # ============================================================
 
-# FlashInfer / CUDA 架构列表（launch.sh 使用；不设置时自动按 nvidia-smi 探测）
-export SGLANG_FLASHINFER_CUDA_ARCH_LIST=8.9f
+# FlashInfer / CUDA 架构列表：不在此硬编码。
+# launch.sh 按 nvidia-smi 探测并加上正确后缀(Ada->8.9、Blackwell->12.0f)。
+# 本 profile 也会被 .envrc 复用到 Blackwell 机型, 写死架构会编译出错误的内核。
+# 确有需要时: export FLASHINFER_CUDA_ARCH_LIST=8.9
 
 # 显存较小：降低静态显存占比防 OOM
 export SGLANG_MEM_FRACTION_STATIC=0.85

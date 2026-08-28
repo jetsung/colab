@@ -18,7 +18,7 @@
 | `colab.sh install sglang` | 根目录 | Colab terminal | 装环境：装 uv → 建 Python 3.12 venv → 装 SGLang（含已知坑修复）；**不自动启动服务**，启动请另跑 `./launch.sh start` |
 | `launch.sh` | `sglang/` | Colab terminal | 服务管理：`start` / `stop` / `restart` / `status` / `logs` / `keep`（守护） |
 | `.envrc` | `sglang/` | Colab terminal | direnv：继承根 `.envrc`，按 `GPU_PROFILE`（或自动探测）加载 `.env.g4`/`.env.t4`，并声明 `SGLANG_*` 空默认（留空即自动推导） |
-| `.env.g4` / `.env.t4` | `sglang/` | Colab terminal | GPU profile（`SGLANG_FLASHINFER_CUDA_ARCH_LIST` / `SGLANG_MEM_FRACTION_STATIC` / `SGLANG_CTX` 等） |
+| `.env.g4` / `.env.t4` | `sglang/` | Colab terminal | GPU profile（`SGLANG_MEM_FRACTION_STATIC` / `SGLANG_CTX` 等；架构由 launch.sh 自动探测） |
 | `colab.sh bore` | 根目录 | Colab terminal | bore 公网隧道：`30000 → ${BORE_PORT:-65535}`，setsid 后台托管，日志 `logs/bore.log` |
 | `sglang.ipynb` | `sglang/` | Colab | 部署流程 Notebook 版：等价于在 terminal 依次执行 setup/install/launch/bore，另含 .env 加载、就绪等待与 API 验证单元格；上传后 Run All 即可，项目路径可自定义（第 0 节填写）或按 环境变量→工作目录→子目录→Drive 自动探测 |
 | `.envrc`（根） | 根目录 | Colab terminal | direnv 入口：`PATH_add`、`API_KEY` / `MODEL_REPO` / `BORE_PORT` 默认值、`dotenv` 加载 `.env`（`.env` 不入 git） |
@@ -131,8 +131,9 @@ print(resp.choices[0].message.content)            # 最终回答
 | `SGLANG_SPECULATIVE_ALGORITHM` | 投机解码算法；留空时按 config.json 是否含 MTP 层自动判断（Qwen3→EAGLE）；置空=关闭 |
 | `SGLANG_SPECULATIVE_NUM_STEPS` / `SGLANG_SPECULATIVE_EAGLE_TOPK` / `SGLANG_SPECULATIVE_NUM_DRAFT_TOKENS` | EAGLE 投机解码参数（默认 3 / 1 / 4） |
 | `SGLANG_MAX_RUNNING_REQUESTS` | 投机解码时的最大并发请求数（默认 48） |
+| `SGLANG_MAMBA_FULL_MEMORY_RATIO` | mamba 状态缓存占比（默认 0.6）；mamba 模型实际并发 ≈ `max_mamba_cache_size/4`，调大提升并发、相应缩小 KV 池 |
 | `SGLANG_MEM_FRACTION_STATIC` | 静态显存占比（默认 0.90；G4/T4 profile 提供 0.85/0.80，防 OOM） |
-| `SGLANG_FLASHINFER_CUDA_ARCH_LIST` | FlashInfer/CUDA 架构（默认按 `nvidia-smi` 探测：G4→`8.9f`、T4→`7.5f`、Blackwell→`12.0f`） |
+| `FLASHINFER_CUDA_ARCH_LIST` | FlashInfer JIT 目标架构（默认按 `nvidia-smi` 探测并加正确后缀：Blackwell→`12.0f`、Ada→`8.9`、Turing→`7.5`；不建议手动改） |
 | `BORE_SECRET` / `BORE_SERVER` | bore 隧道凭据与中继服务器 |
 | `RELAYDROP_RELAY` / `RELAYDROP_PASSWORD` | relaydrop 凭据 |
 | `OPENCODE_API_KEY` | opencode 客户端密钥 |
@@ -159,6 +160,25 @@ curl http://localhost:30000/health # 健康检查
 curl http://localhost:30000/metrics# Prometheus 指标
 nvidia-smi                         # 显存占用
 ```
+
+### 并发压测
+
+根目录的 [bench.py](../bench.py)（仅用标准库，sglang / llama.cpp 通用）并发打 N 条请求，
+输出聚合吞吐、单请求延迟，并采样服务端 `num_running_reqs` / `num_queue_reqs` 峰值，
+可判断并发是否被引擎上限卡住：
+
+```bash
+cd /content/colab                    # 项目根目录
+./bench.py -n 32 --max-tokens 256            # 默认连 localhost:30000, 引擎与模型自动识别
+./bench.py -n 64 --port 30000 --model qwen3.8-27b
+
+# 等价入口(自动经 direnv 加载密钥)
+./colab.sh sglang bench -n 64 --max-tokens 256
+make sglang-bench BENCH_ARGS="-n 64 --max-tokens 256"
+```
+
+对比引擎参数（如 `SGLANG_MAMBA_FULL_MEMORY_RATIO`）时固定 `-n` / `--max-tokens`，
+看聚合吞吐、最大延迟和 queue 峰值三项。鉴权密钥从 `SGLANG_API_KEY` / `API_KEY` 读取。
 
 ## 详细文档
 

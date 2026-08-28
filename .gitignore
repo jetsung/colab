@@ -4,3 +4,7 @@
 **/logs
 
 **/*.pid
+
+# Python(根目录 bench.py)
+__pycache__/
+*.py[cod]
