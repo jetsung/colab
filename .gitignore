@@ -1,7 +1,6 @@
 .env
 
-sglang.pid
-bore.pid
-
 **/tmp
 **/logs
+
+**/*.pid

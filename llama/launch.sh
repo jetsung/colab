@@ -12,15 +12,16 @@
 #   ./launch.sh keep      守护模式(崩溃自动拉起)
 #
 # 依赖:
-#   - install.sh 已编译出 llama-server
+#   - install 已装好 llama 二进制(编译或官方预编译)
 #   - 环境变量 HF_TOKEN 已设置（且已在 HF 接受模型许可证）
 #
 # 环境变量(可被外部/命令行覆盖):
 #   LLAMA_MODEL_REPO  模型仓库(不可为空; 未设置时回退 MODEL_REPO)
-#   LLAMA_MODEL_NAME  模型名前缀(未设置时从 REPO 提取: / 后部分去 -GGUF)
+#   LLAMA_MODEL_NAME  模型名前缀(未设置时从 REPO 提取: / 后部分去 -GGUF); 同时用作服务 --alias 别名
 #   LLAMA_QUANT       量化档(不可为空, 无默认; 由 .envrc / gpu profile 提供)
 #   LLAMA_MODEL_DIR   模型目录(默认 /content/models/<repo名>/<quant>)
-#   LLAMA_SERVER      llama-server 二进制路径
+#   LLAMA_DIR       安装目录(默认 /content/llama.cpp; 由 .envrc 导出, 可覆盖)
+#   LLAMA_SERVER     llama 二进制路径(默认从 PATH 查找 command -v llama; 未命中回退 <LLAMA_DIR>/build/bin)
 #   LLAMA_HOST / LLAMA_PORT   监听地址与端口(内部变量 HOST/PORT, 默认 0.0.0.0 / 30000)
 #   LLAMA_API_KEY     服务器 API 密钥(未设置时回退 API_KEY)
 #   LLAMA_XET         1=启用 HF Xet 存储(默认), 0=禁用
@@ -57,7 +58,17 @@ readonly LLAMA_QUANT="${LLAMA_QUANT:-}"
 # 模型目录: 默认用仓库名(保留 -GGUF 后缀)
 #   例: Qwen3.8-Flash-Next-GGUF -> /content/models/Qwen3.8-Flash-Next-GGUF/$LLAMA_QUANT
 readonly LLAMA_MODEL_DIR="${LLAMA_MODEL_DIR:-/content/models/$LLAMA_REPO_NAME/$LLAMA_QUANT}"
-readonly LLAMA_SERVER="${LLAMA_SERVER:-/content/llama.cpp/build/bin/llama-server}"
+# 安装目录(默认 /content/llama.cpp; .envrc 已 export, 此处兜底)
+readonly LLAMA_DIR="${LLAMA_DIR:-/content/llama.cpp}"
+# 统一二进制解析优先级: 显式 LLAMA_SERVER > PATH 查找 command -v llama(新版 llama serve) > 默认 <LLAMA_DIR>/build/bin/llama
+if [[ -n "${LLAMA_SERVER:-}" ]]; then
+  :   # 保持显式指定值
+elif command -v llama >/dev/null 2>&1; then
+  LLAMA_SERVER="$(command -v llama)"
+else
+  LLAMA_SERVER="$LLAMA_DIR/build/bin/llama"
+fi
+readonly LLAMA_SERVER
 # 监听地址与端口: 内部变量 HOST/PORT, 可用 LLAMA_HOST / LLAMA_PORT 环境变量覆盖
 readonly PORT="${LLAMA_PORT:-30000}"
 readonly HOST="${LLAMA_HOST:-0.0.0.0}"
@@ -76,8 +87,9 @@ readonly CMD_LOG="${LOG_DIR}/launch_cmd.log"    # 启动命令日志(追加, 带
 readonly PID_FILE="${SCRIPT_DIR}/llama.pid"
 readonly KEEP_LOG="${LOG_DIR}/keeper.log"
 
-# pgrep 匹配模式(括号防自匹配)
-readonly PROC_PATTERN="llama-serve[r]"
+# pgrep 匹配模式(括号防自匹配): 新版统一命令 "llama serve"
+# 前置边界 (^|[^a-z]) 排除 ollama serve(其 "llama" 前是字母 o)
+readonly PROC_PATTERN="(^|[^a-z])llama serv[e]"
 
 # ----------------------------- 内部函数 --------------------------------------
 pgrep_server() {
@@ -98,10 +110,21 @@ wait_stopped() {
   return 1
 }
 
-# 校验: llama-server 二进制与 HF_TOKEN
+# 校验: llama 二进制与 HF_TOKEN
 check_deps() {
-  if [[ ! -x "$LLAMA_SERVER" ]]; then
-    echo "ERROR: 找不到 llama-server ($LLAMA_SERVER)。请先运行 install.sh 编译。" >&2
+  if ! command -v "$LLAMA_SERVER" >/dev/null 2>&1; then
+    cat >&2 <<EOF
+ERROR: 找不到 llama 二进制: $LLAMA_SERVER
+
+请先安装(二选一):
+  ./colab.sh install llama            # 官方预编译二进制(快速, 免编译)
+  ./colab.sh install llama --build    # 源码编译(PR #27742, 支持 Qwen3.8-Flash-Next)
+
+若已安装但仍找不到:
+  - 在 llama/ 目录下重新执行(或 cd .. && cd llama 触发 direnv 刷新 PATH)
+  - 检查 LLAMA_DIR / LLAMA_SERVER 环境变量是否被覆盖
+  - 手动验证: command -v llama
+EOF
     exit 1
   fi
   if [[ -z "${HF_TOKEN:-}" ]]; then
@@ -124,8 +147,8 @@ resolve_model_file() {
   fi
   existing=$(find "$LLAMA_MODEL_DIR" -maxdepth 1 -name "$LLAMA_MODEL_NAME-$LLAMA_QUANT-0000*-of-0000*.gguf" -printf '%f\n' 2>/dev/null | wc -l || true)
   if [[ -z "$first" || "${existing:-0}" -lt "${total:-3}" ]]; then
-    echo ">> 本地模型不足或不完整（现有 ${existing:-0}/${total:-?} 分片），开始下载 $LLAMA_MODEL_REPO ($LLAMA_QUANT) ..."
-    echo "   (该仓库使用 Xet 存储，需要 hf_xet；install.sh 已安装)"
+    echo ">> 本地模型不足或不完整（现有 ${existing:-0}/${total:-?} 分片），开始下载 $LLAMA_MODEL_REPO ($LLAMA_QUANT) ..." >&2
+    echo "   (该仓库使用 Xet 存储，需要 hf_xet；install.sh 已安装)" >&2
     if [[ "$LLAMA_XET" == "1" ]]; then
       HF_HUB_ENABLE_XET=1 HF_TOKEN="$HF_TOKEN" \
         hf download "$LLAMA_MODEL_REPO" --include "$LLAMA_QUANT/*" --local-dir "$LLAMA_MODEL_DIR"
@@ -134,7 +157,7 @@ resolve_model_file() {
         hf download "$LLAMA_MODEL_REPO" --include "$LLAMA_QUANT/*" --local-dir "$LLAMA_MODEL_DIR"
     fi
   else
-    echo ">> 模型已存在 ($existing/$total 分片)，跳过下载。"
+    echo ">> 模型已存在 ($existing/$total 分片)，跳过下载。" >&2
   fi
 
   local MODEL_FILE
@@ -183,15 +206,19 @@ do_start() {
   fi
 
   # 展开后的启动命令(回显 + 写入日志, 便于排查)
-  local   LAUNCH_CMD=("$LLAMA_SERVER"
+  # 官方统一命令: llama serve(参数与旧 llama-server 一致)
+  # --alias: 模型别名(默认 = LLAMA_MODEL_NAME, 即剃除 / 前缀与 -GGUF 后缀的仓库名),
+  #          避免 API 中显示为实际文件路径
+  local   LAUNCH_CMD=("$LLAMA_SERVER" serve
     -m "$MODEL_FILE"
+    --alias "$LLAMA_MODEL_NAME"
     -ngl "$LLAMA_NGL"
     --host "$HOST"
     --port "$PORT"
     --ctx-size "$LLAMA_CTX")
   LAUNCH_CMD+=("${SERVER_ARGS[@]}")
 
-  echo "启动 llama-server... (日志: ${LOG_FILE})" | tee -a "$LOG_FILE"
+  echo "启动 llama 服务... (日志: ${LOG_FILE})" | tee -a "$LOG_FILE"
   echo ">> 加载模型: $MODEL_FILE" | tee -a "$LOG_FILE"
   echo ">> 启动命令: ${LAUNCH_CMD[*]}" | tee -a "$LOG_FILE"
 
@@ -201,7 +228,7 @@ do_start() {
     printf '  %s\n' "${LAUNCH_CMD[@]}"
   } >>"$CMD_LOG"
 
-  # setsid 脱离终端, 子 shell 写入真实 PID 后 exec 替换为 llama-server
+  # setsid 脱离终端, 子 shell 写入真实 PID 后 exec 替换为 llama 服务进程
   # 命令与参数以 "$@" 透传, 规避手工转义
   # shellcheck disable=SC2016
   setsid bash -c '
@@ -225,7 +252,7 @@ do_stop() {
     rm -f "$PID_FILE"
     exit 0
   fi
-  echo "停止 llama-server..."
+  echo "停止 llama 服务..."
   pkill -TERM -f "$PROC_PATTERN" 2>/dev/null || true
   if wait_stopped; then
     echo "已停止"
@@ -259,7 +286,7 @@ do_status() {
 # 发送一条测试 chat 对话到平台(先确认服务已启动并就绪)
 do_test() {
   if ! is_running && ! pgrep_server; then
-    echo "错误: llama-server 未在运行。请先执行: $0 start" >&2
+    echo "错误: llama 服务未在运行。请先执行: $0 start" >&2
     exit 1
   fi
   local code

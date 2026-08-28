@@ -6,7 +6,7 @@
 # 子命令:
 #   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
 #   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
-#   install <engine>                      Colab 内: 安装并启用引擎环境(engine: llama | sglang)
+#   install <engine> [--build|-B]       Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认官方预编译二进制, --build 编译源码)
 #   llama start|stop|restart|status|test|logs|keep   Colab 内: llama.cpp 服务管理(透传 llama/launch.sh)
 #   sglang start|stop|restart|status|test|logs|keep  Colab 内: SGLang 服务管理(透传 sglang/launch.sh)
 #   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
@@ -37,7 +37,7 @@ usage_root() {
 子命令:
   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
-  install <engine>                      Colab 内: 安装并启用引擎环境(engine: llama | sglang)
+  install <engine> [--build|-B]          Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认官方预编译二进制, --build 编译源码)
   llama start|stop|restart|status|test|logs|keep   Colab 内: llama.cpp 服务管理(动作见 llama -h)
   sglang start|stop|restart|status|test|logs|keep  Colab 内: SGLang 服务管理(动作见 sglang -h)
   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
@@ -133,14 +133,18 @@ EOF
 
 usage_install() {
   cat <<'EOF'
-用法: colab.sh install <engine>
+用法: colab.sh install <engine> [--build | -B]
 
   Colab terminal(tmux) 环境内: 安装并启用引擎运行环境(Python 依赖统一用 uv 管理)
   engine:
-    llama     编译支持 Qwen3.8-Flash-Next 的 llama.cpp(含 GPU profile 自动加载)
+    llama     安装 llama.cpp 服务
+              默认: 下载官方预编译二进制(ubuntu-cuda-x64, 快速免编译)
+              --build / -B: 编译源码(支持 Qwen3.8-Flash-Next 的 PR #27742)
     sglang    建 venv + 装 SGLang(不自动启动, 启动请另跑 sglang/launch.sh)
 
-  help        显示本帮助
+选项:
+  --build, -B   llama 使用源码编译方式(默认官方预编译二进制)
+  -h, --help    显示本帮助
 EOF
 }
 
@@ -284,8 +288,15 @@ setup_deps() {
     # shellcheck disable=SC2016
     echo 'eval "$(direnv hook bash)"' | tee -a ~/.bashrc
   fi
+  # source 交互式 bashrc 前放宽选项: Colab 非交互执行时 PS1 等提示符变量未定义,
+  # set -u 下会报 "PS1: unbound variable" 中止脚本(如 /root/.bashrc: line 2)
+  local saved_opts
+  saved_opts=$(set +o)        # 保存当前 shell 选项(-e/-u/-x/pipefail)
+  PS1="${PS1:-}"              # 预置默认值(若原本已定义则保留原值)
+  set +eu                     # 临时关闭: bashrc 内可能引用未定义变量/命令失败
   # shellcheck source=/dev/null
   source ~/.bashrc
+  eval "$saved_opts"          # 恢复原选项
 }
 
 setup_bore() {
@@ -322,9 +333,36 @@ setup_hint() {
 # ============================== install 子命令 ==============================
 do_install() {
   local engine="${1:-}"
+  shift || true
+  local mode="prebuilt"   # 默认: 官方预编译二进制; --build/-B 切换为源码编译
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --build | -B)     mode="build" ;;
+      --prebuilt | -P)  mode="prebuilt" ;;
+      -h | --help)      usage_install; exit 0 ;;
+      *)
+        echo "错误: 未知参数 '$1' (install 支持: --build/-B 源码编译, 默认官方预编译二进制)" >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
   case "$engine" in
-    llama)  install_llama ;;
-    sglang) install_sglang ;;
+    llama)
+      if [[ "$mode" == "build" ]]; then
+        install_llama_build
+      else
+        install_llama_prebuilt
+      fi
+      ;;
+    sglang)
+      if [[ "$mode" == "build" ]]; then
+        echo "错误: sglang 不支持 --build(仅 llama 提供源码编译方式)" >&2
+        exit 1
+      fi
+      install_sglang
+      ;;
     help | -h | --help) usage_install ;;
     "")
       usage_install
@@ -338,30 +376,22 @@ do_install() {
   esac
 }
 
-# ----------------------- install llama: 编译 llama.cpp -----------------------
-install_llama() {
-  # 自动加载 GPU profile (llama/.env.<g4|t4>, 与 llama/.envrc 的加载规则一致)
-  # GPU_PROFILE 显式指定优先; 否则按 nvidia-smi 探测的显卡型号自动匹配
-  local PROFILES_DIR="${SCRIPT_DIR}/llama"
-  load_llama_profile() {
-    local name gpu PROFILES
-    name="${GPU_PROFILE:-}"
-    if [[ -z "$name" ]]; then
-      gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
-      case "$gpu" in
-        *T4*) name=t4 ;;
-        *G4*|*L4*) name=g4 ;;
-      esac
-    fi
-    PROFILES="$PROFILES_DIR/.env.${name}"
-    if [[ -n "$name" && -f "$PROFILES" ]]; then
-      echo ">> 加载 GPU profile: $PROFILES (GPU=$gpu)"
-      set -a; source "$PROFILES"; set +a
-    else
-      echo ">> 未匹配 GPU profile（GPU=${gpu:-未知}, GPU_PROFILE=${GPU_PROFILE:-空}），使用默认值/自动探测"
-    fi
-  }
-  load_llama_profile
+# ---------------- install llama: 源码编译(PR #27742, 支持 Qwen3.8-Flash-Next) ----------------
+install_llama_build() {
+  # 环境变量统一由 direnv 管理: cd 进 llama/ 目录并批准 .envrc 后注入当前 shell
+  # (.envrc 含 source_up 继承根配置 + GPU 探测自动加载 .env.<g4|t4>),
+  # 替代原 load_llama_profile 的手动 profile 加载逻辑
+  cd "${SCRIPT_DIR}/llama"
+  if command -v direnv >/dev/null 2>&1; then
+    direnv allow . || true      # 批准本目录 .envrc(幂等)
+    direnv allow .. || true     # 根 .envrc 需一并批准(source_up 继承)
+    # direnv hook 仅在交互式 cd 时自动触发, 脚本内需显式注入环境变量
+    # shellcheck disable=SC1090
+    eval "$(direnv export bash)" || \
+      echo "警告: direnv 环境加载失败, 使用默认值/自动探测" >&2
+  else
+    echo "警告: 未检测到 direnv, LLAMA_* 环境变量需已手动设置" >&2
+  fi
 
   local LLAMA_DIR="${LLAMA_DIR:-/content/llama.cpp}"
   local PR_NUM=27742
@@ -436,6 +466,62 @@ install_llama() {
   echo ">> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/llama/launch.sh"
 }
 
+# --------------- install llama: 官方预编译二进制(ubuntu-cuda-x64) ---------------
+# 从 GitHub 最新 release 下载官方 CUDA 版二进制, 解压到 $LLAMA_DIR/build/bin/
+# (与编译版路径一致, launch.sh 默认 LLAMA_SERVER 无需改动)
+install_llama_prebuilt() {
+  local LLAMA_DIR="${LLAMA_DIR:-/content/llama.cpp}"
+  local BIN_DIR="${LLAMA_DIR}/build/bin"
+  local TMP_ZIP="/tmp/llama_cuda_prebuilt.zip"
+  local TMP_DIR="/tmp/llama_prebuilt"
+
+  echo ">> 下载 llama.cpp 官方预编译二进制 (ubuntu-cuda-x64)"
+  echo ">> 安装目录: $LLAMA_DIR (二进制: $BIN_DIR/llama-server)"
+
+  if ! command -v unzip >/dev/null 2>&1; then
+    echo "ERROR: 缺少 unzip, 请先安装 (apt install -y unzip)" >&2
+    exit 1
+  fi
+
+  # 解析最新 release 中 CUDA 资产的下载地址(GitHub API)
+  local asset_url
+  asset_url=$(curl -fsSL https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | python3 -c '
+import sys, json
+for a in json.load(sys.stdin).get("assets", []):
+    if "bin-ubuntu-cuda-x64.zip" in a["name"]:
+        print(a["browser_download_url"]); break
+' 2>/dev/null || true)
+  if [[ -z "$asset_url" ]]; then
+    echo "ERROR: 未找到 llama.cpp 最新 release 的 ubuntu-cuda-x64 二进制资产" >&2
+    exit 1
+  fi
+  echo ">> 资产: $asset_url"
+
+  curl -fL "$asset_url" -o "$TMP_ZIP" || { echo "ERROR: 下载失败" >&2; exit 1; }
+  rm -rf "$TMP_DIR"
+  mkdir -p "$TMP_DIR"
+  unzip -q "$TMP_ZIP" -d "$TMP_DIR" || { echo "ERROR: 解压失败" >&2; exit 1; }
+
+  # 定位 llama-server, 将所在 bin/ 目录全部复制(含 .so 依赖库)
+  local server_bin
+  server_bin=$(find "$TMP_DIR" -type f -name llama-server | head -1 || true)
+  if [[ -z "$server_bin" ]]; then
+    echo "ERROR: 压缩包内未找到 llama-server" >&2
+    rm -rf "$TMP_DIR" "$TMP_ZIP"
+    exit 1
+  fi
+  mkdir -p "$BIN_DIR"
+  cp -a "$(dirname "$server_bin")/." "$BIN_DIR/"
+  rm -rf "$TMP_DIR" "$TMP_ZIP"
+
+  [[ -x "$BIN_DIR/llama-server" ]] || chmod +x "$BIN_DIR/llama-server"
+  echo ">> 完成。二进制: $BIN_DIR/llama-server"
+  "$BIN_DIR/llama-server" --version || true
+
+  echo ""
+  echo ">> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/llama/launch.sh"
+}
+
 # ----------------------- install sglang: venv + SGLang -----------------------
 install_sglang() {
   local WORKDIR="${SCRIPT_DIR}/sglang"                          # 工作目录 = sglang/ 子目录
@@ -490,6 +576,10 @@ do_engine() {
     start | stop | restart | status | test | logs | keep)
       # direnv exec 会进入目录并加载其 .envrc(source_up 继承根配置 + GPU profile)
       if command -v direnv >/dev/null 2>&1; then
+        # 首次执行时 .envrc 可能未批准(blocked 报错), 自动 allow(幂等):
+        # 引擎目录 + 根目录( source_up 继承需要 ), allow 失败不阻塞
+        direnv allow "$dir" >/dev/null 2>&1 || true
+        direnv allow "$SCRIPT_DIR" >/dev/null 2>&1 || true
         exec direnv exec "$dir" "$script" "$action" "${@:2}"
       else
         # 无 direnv 时降级: 直接执行(环境变量需已由外部提供)

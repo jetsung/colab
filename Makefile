@@ -49,17 +49,18 @@ help list:
 	       subgrp=grp; if(i=index(subgrp,"/")){ grp=substr(subgrp,1,i-1); subgrp=substr(subgrp,i+1) } else { subgrp="" } \
 	       tgt=line; sub(/^\[[^]]*\][ \t]*/,"",tgt); sub(/:.*/,"",tgt); \
 	       desc=substr(line,index(line,":")+1); sub(/^[ \t]+/,"",desc); \
-	       key=grp "\x1e" subgrp; \
+	       key=grp SUBSEP subgrp; \
 	       item[key]=item[key] sprintf("    \033[36mmake %-16s\033[0m %s\n", tgt, desc); \
+	       if(!(key in seen)){ seen[key]=1; order[++n]=key } \
 	     } \
 	     END{ \
-	       n=asorti(item, keys); \
 	       lastgrp=""; \
 	       for(k=1;k<=n;k++){ \
-	         split(keys[k], p, "\x1e"); \
+	         key=order[k]; \
+	         split(key, p, SUBSEP); \
 	         if(p[1]!=lastgrp){ printf "\033[33m[%s]\033[0m\n", p[1]; lastgrp=p[1] } \
 	         if(p[2]!=""){ printf "  \033[32m%s\033[0m\n", p[2] } \
-	         printf "%s", item[keys[k]]; \
+	         printf "%s", item[key]; \
 	       } \
 	     }' $(MAKEFILE_LIST)
 

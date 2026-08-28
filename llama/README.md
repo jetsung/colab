@@ -52,7 +52,7 @@ export HF_TOKEN=hf_xxxxxxxxxxxxxxxx
 ```
 
 1. 在 https://huggingface.co/settings/tokens 创建一个 **read** 权限的 token。
-2. 打开 https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF（如需跳转到基础模型页也一并操作），点击 **Agree** 接受 `qwen-community-1.0` 许可证。
+2. 打开 https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF （如需跳转到基础模型页也一并操作），点击 **Agree** 接受 `qwen-community-1.0` 许可证。
 3. 把 token 导出到环境变量（或写进你的 shell profile）。
 
 ---
