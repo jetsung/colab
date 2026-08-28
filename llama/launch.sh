@@ -127,8 +127,8 @@ check_deps() {
 ERROR: 找不到 llama 二进制: $LLAMA_SERVER
 
 请先安装(二选一):
-  ./colab.sh install llama            # 官方预编译二进制(快速, 免编译)
-  ./colab.sh install llama --build    # 源码编译(PR #27742, 支持 Qwen3.8-Flash-Next)
+  ./colab.sh install llama            # GitHub 最新 prerelease Ubuntu 通用预编译二进制(快速, 免编译)
+  ./colab.sh install llama --build    # 源码编译 CUDA 版本(PR #27742, 支持 Qwen3.8-Flash-Next)
 
 若已安装但仍找不到:
   - 在 llama/ 目录下重新执行(或 cd .. && cd llama 触发 direnv 刷新 PATH)
@@ -148,7 +148,9 @@ resolve_model_file() {
   mkdir -p "$LLAMA_MODEL_DIR"
 
   # ---- 下载（按总分片数判断是否完整）----
-  local first total existing
+  local first total existing model_root_dir
+  # Hugging Face 会保留 --include 中的量化目录层级, 因此 local-dir 必须指向仓库目录的父级
+  model_root_dir="$(dirname "$LLAMA_MODEL_DIR")"
   # 分片 glob 模式(传给 find 展开, 避免赋值字面化)
   first=$(find "$LLAMA_MODEL_DIR" -maxdepth 1 -name "$LLAMA_MODEL_NAME-$LLAMA_QUANT-0000*-of-0000*.gguf" -printf '%f\n' 2>/dev/null | sort | head -1 || true)
   total=""
@@ -161,10 +163,10 @@ resolve_model_file() {
     echo "   (该仓库使用 Xet 存储，需要 hf_xet；install.sh 已安装)" >&2
     if [[ "$LLAMA_XET" == "1" ]]; then
       HF_HUB_ENABLE_XET=1 HF_TOKEN="$HF_TOKEN" \
-        hf download "$LLAMA_MODEL_REPO" --include "$LLAMA_QUANT/*" --local-dir "$LLAMA_MODEL_DIR"
+        hf download "$LLAMA_MODEL_REPO" --include "$LLAMA_QUANT/*" --local-dir "$model_root_dir"
     else
       HF_TOKEN="$HF_TOKEN" \
-        hf download "$LLAMA_MODEL_REPO" --include "$LLAMA_QUANT/*" --local-dir "$LLAMA_MODEL_DIR"
+        hf download "$LLAMA_MODEL_REPO" --include "$LLAMA_QUANT/*" --local-dir "$model_root_dir"
     fi
   else
     echo ">> 模型已存在 ($existing/$total 分片)，跳过下载。" >&2
