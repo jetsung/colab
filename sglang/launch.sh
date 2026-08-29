@@ -18,6 +18,10 @@
 #
 # 环境变量(可被外部/命令行覆盖):
 #   SGLANG_MODEL_REPO    模型(HF ID 或本地路径); 未设置时回退 MODEL_REPO
+#   SGLANG_MODEL_ROOT    模型基础盘前缀(未设置回退 MODEL_ROOT, 再兜底 /content/models)
+#                        不支持 Google Drive(/content/drive): 指向 Drive 的路径会在启动时报错
+#   SGLANG_MODEL_DIR     本仓库模型目录(默认 <ROOT>/<repo名>; 显式设置时原样使用)
+#                        HF ID 启动时权重会下载到该目录(持久化), 命中本地目录则离线直接启动
 #   SGLANG_SERVED_NAME   API 模型别名(默认取模型路径末段小写)
 #   SGLANG_HOST / SGLANG_PORT   监听地址与端口(默认 0.0.0.0 / 30000)
 #   SGLANG_CTX    最大上下文(默认0=由 config.json 推导)
@@ -32,6 +36,7 @@
 #   CUDA_HOME / CUDA_PATH       JIT 编译用的 CUDA 工具链(影响架构取值; 默认用系统 nvcc)
 #   SGLANG_REASONING_PARSER / SGLANG_TOOL_CALL_PARSER / SGLANG_CHAT_TEMPLATE_KWARGS
 #   SGLANG_API_KEY       鉴权密钥(未设置时回退 API_KEY; 两者均空则报错, 显式置空关闭鉴权)
+#   SGLANG_VENV_DIR      Python 虚拟环境目录(默认 /tmp/sglang/venv, 见下)
 # =============================================================================
 
 if [[ -n "${DEBUG:-}" ]]; then
@@ -45,8 +50,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 
-readonly WORKDIR="$SCRIPT_DIR"                                 # 工作目录(含 .venv)
-readonly VENV_DIR="${WORKDIR}/.venv"
+readonly WORKDIR="$SCRIPT_DIR"                                 # 工作目录(脚本/配置所在)
+# venv 默认建在项目外: sglang 依赖数 GB(torch + CUDA 包), 放项目里会让整个目录难以复制/备份。
+# 需要换位置(如放到持久化盘)时用 SGLANG_VENV_DIR 覆盖; 该默认值与 colab.sh install sglang 一致。
+readonly VENV_DIR="${SGLANG_VENV_DIR:-/tmp/sglang/venv}"
 # 日志统一写到项目根目录的 logs/(无论从根目录还是 sglang/ 下执行, 均落同一处)
 ROOT_DIR="$(cd "$(dirname "$SCRIPT_DIR")" && pwd)"             # 项目根目录 = sglang/ 的父目录
 readonly ROOT_DIR
@@ -56,10 +63,64 @@ readonly CMD_LOG="${LOG_DIR}/launch_cmd.log"    # 启动命令日志(追加, 带
 readonly PID_FILE="${WORKDIR}/sglang.pid"
 readonly KEEP_LOG="${LOG_DIR}/keeper.log"
 
+# GPU profile 兜底加载(不依赖 direnv), 与 llama/launch.sh 同逻辑:
+# 环境变量继承调用方 shell; 未 cd 进本目录(引擎 .envrc 未加载)时, 按 GPU_PROFILE
+# (未设置则按 nvidia-smi 探测)source 本目录 .env.<g4|t4>, 补上 SGLANG_MEM_FRACTION_STATIC 等
+# 引擎专属默认值。profile 为纯 bash(${VAR:-默认}), 幂等且不覆盖已有值。
+load_gpu_profile() {
+  local profile="${GPU_PROFILE:-}"
+  if [[ -z "$profile" ]]; then
+    local gpu
+    gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+    case "$gpu" in
+      *T4*)                  profile=t4 ;;
+      *G4*|*L4*|*Blackwell*) profile=g4 ;;   # Blackwell 系(如 RTX PRO 6000)按 G4 处理
+    esac
+  fi
+  [[ -n "$profile" ]] || return 0
+  local f="${SCRIPT_DIR}/.env.${profile}"
+  [[ -r "$f" ]] || return 0
+  echo ">> [sglang] 加载 GPU profile: ${profile} (${f})" >&2
+  # shellcheck disable=SC1090
+  source "$f"
+}
+# 仅需要模型参数的子命令才兜底, 避免 status/stop/logs 也去探测显卡
+case "${1:-}" in
+  start | restart) load_gpu_profile ;;
+esac
+
 # 模型(HF ID 或本地路径): 优先 SGLANG_MODEL_REPO, 回退通用 MODEL_REPO
 # 硬约束: 两者均空时 do_start 报错(参照 llama/launch.sh)
 readonly SGLANG_MODEL_REPO="${SGLANG_MODEL_REPO:-${MODEL_REPO:-}}"
-readonly MODEL_PATH="$SGLANG_MODEL_REPO"
+readonly SGLANG_MODEL_REPO_NAME="${SGLANG_MODEL_REPO##*/}"
+# 模型路径(两级: 基础盘前缀 + 本仓库目录), 与 llama/launch.sh 的 LLAMA_MODEL_ROOT/DIR 对称
+#   SGLANG_MODEL_ROOT  基础盘前缀(三级优先级, 见下方解析; 与 llama/launch.sh 对称)
+#                      换持久化盘只改这一层(或改根 .envrc 的 MODEL_ROOT, 两引擎同时生效)
+#   SGLANG_MODEL_DIR   本仓库模型目录(默认 <ROOT>/<repo名>, 按仓库隔离; 显式设置时原样使用)
+#                      HF ID 启动时权重下载到该目录(见 resolve_model_path), 跨会话可复用;
+#                      已给本地路径时不做拼接也不下载。
+# 基础盘前缀解析(显式逐级判定, 便于看清优先级; 字面量仅作最后兜底):
+#   1) SGLANG_MODEL_ROOT  引擎专属, 优先级最高
+#   2) MODEL_ROOT         两引擎共用(根 .envrc 导出), 换持久化盘改这一处两引擎同时生效
+#   3) /content/models    兜底默认值, 仅在上述两者均未设置(或为空)时使用
+# "已设置" = 变量存在且非空(空串等同未设置, 继续回退); 来源记入 MODEL_ROOT_SOURCE 便于排查
+MODEL_ROOT_SOURCE=""
+if [[ -n "${SGLANG_MODEL_ROOT:-}" ]]; then
+  MODEL_ROOT_SOURCE="SGLANG_MODEL_ROOT"
+elif [[ -n "${MODEL_ROOT:-}" ]]; then
+  SGLANG_MODEL_ROOT="$MODEL_ROOT"
+  MODEL_ROOT_SOURCE="MODEL_ROOT"
+else
+  SGLANG_MODEL_ROOT="/content/models"
+  MODEL_ROOT_SOURCE="默认值(兜底)"
+fi
+readonly SGLANG_MODEL_ROOT MODEL_ROOT_SOURCE
+# 不支持 Google Drive 作为模型目录: Drive 是 FUSE 挂载, mmap 随机读极慢, 且不提供任何
+# 冷存储/复制降级 —— 指向 /content/drive 的路径在启动时直接报错(见 do_start 内校验)。
+SGLANG_MODEL_DIR="${SGLANG_MODEL_DIR:-${SGLANG_MODEL_REPO_NAME:+$SGLANG_MODEL_ROOT/$SGLANG_MODEL_REPO_NAME}}"
+readonly SGLANG_MODEL_DIR
+# 实际 --model-path: 初始为 SGLANG_MODEL_REPO, do_start 内由 resolve_model_path 改写为本地目录
+MODEL_PATH="$SGLANG_MODEL_REPO"
 # API 中使用的模型别名: 默认取模型路径末段(小写, 斜杠转连字符); 可用 SGLANG_SERVED_NAME 覆盖
 SERVED_NAME_DEFAULT="$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]' | tr '/' '-')"
 readonly SERVED_NAME_DEFAULT
@@ -167,7 +228,8 @@ wait_stopped() {
 require_venv() {
   if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
     echo "未找到虚拟环境: ${VENV_DIR}" >&2
-    echo "请先运行 install.sh 初始化环境" >&2
+    echo "请先在项目根目录运行 './colab.sh install sglang' 初始化环境" >&2
+    echo "或设置 SGLANG_VENV_DIR 指向已有的 venv" >&2
     exit 1
   fi
   # shellcheck disable=SC1091
@@ -297,6 +359,34 @@ detect_speculative_algorithm() {
   printf ''
 }
 
+# 解析实际 --model-path(持久化布局):
+#   本地路径(绝对/相对) -> 原样使用, 不拼接也不下载
+#   HF ID -> 命中 <ROOT>/<repo名>/config.json 则直接用(离线可起);
+#            否则 hf download 下载到该目录后再用, 使权重跨会话复用
+#            下载失败(无 hf / 无网络 / 未授权)仅告警并回退 HF ID, 交由 sglang 自行下载
+resolve_model_path() {
+  local repo="$MODEL_PATH"
+  case "$repo" in
+    /* | ./* | ../*) return 0 ;;          # 已是本地路径
+  esac
+  [[ -n "$SGLANG_MODEL_DIR" ]] || return 0
+  if [[ -f "$SGLANG_MODEL_DIR/config.json" ]]; then
+    echo ">> 命中本地模型目录: $SGLANG_MODEL_DIR" >&2
+    MODEL_PATH="$SGLANG_MODEL_DIR"
+    return 0
+  fi
+  if ! command -v hf >/dev/null 2>&1; then
+    echo "警告: 未找到 hf 命令, 回退 HF ID 启动(由 sglang 自行下载到 HF cache)" >&2
+    return 0
+  fi
+  echo ">> 下载模型 $repo -> $SGLANG_MODEL_DIR ..." >&2
+  if HF_HUB_ENABLE_XET=1 hf download "$repo" --local-dir "$SGLANG_MODEL_DIR"; then
+    MODEL_PATH="$SGLANG_MODEL_DIR"
+  else
+    echo "警告: 下载失败, 回退 HF ID 启动(由 sglang 自行下载); 需持久化请检查 HF_TOKEN / 网络" >&2
+  fi
+}
+
 do_start() {
   if is_running; then
     echo "服务已在运行 (PID $(cat "$PID_FILE")), 如需重启请执行: $0 restart"
@@ -317,6 +407,14 @@ do_start() {
     exit 1
   fi
 
+  # Google Drive 不支持作为模型目录(含通过 SGLANG_MODEL_ROOT / MODEL_ROOT 间接指向,
+  # 以及把本地路径直接指定为 /content/drive 下的模型)
+  if [[ "$SGLANG_MODEL_DIR" == /content/drive/* || "$SGLANG_MODEL_DIR" == /content/drive \
+    || "$MODEL_PATH" == /content/drive/* || "$MODEL_PATH" == /content/drive ]]; then
+    echo "错误: 不支持 Google Drive 作为模型目录: $SGLANG_MODEL_DIR" >&2
+    exit 1
+  fi
+
   # 鉴权密钥检查: 必须由 SGLANG_API_KEY 或回退的 API_KEY 提供(经 .envrc/.env 加载)
   # 两者均未设置时报错; 显式置空(SGLANG_API_KEY="" 或 API_KEY="")则关闭鉴权
   if [[ -z "${SGLANG_API_KEY+x}" && -z "${API_KEY+x}" ]]; then
@@ -324,6 +422,9 @@ do_start() {
     echo "若要临时关闭鉴权: SGLANG_API_KEY=\"\" $0 start" >&2
     exit 1
   fi
+
+  # HF ID -> 本地持久化目录(命中则跳过下载; 失败仅告警, 回退 HF ID)
+  resolve_model_path
 
   # ---- 基于缓存/本地模型 config.json 推导参数 ----
   local MODEL_CONFIG FAMILY CTX
@@ -454,6 +555,7 @@ do_start() {
 
   echo "启动 SGLang 服务... (日志: ${LOG_FILE})" | tee -a "$LOG_FILE"
   echo ">> 模型: $MODEL_PATH" | tee -a "$LOG_FILE"
+  echo ">> 模型基础盘: $SGLANG_MODEL_ROOT (来源: $MODEL_ROOT_SOURCE)" | tee -a "$LOG_FILE"
   echo ">> FlashInfer 架构: FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-<自动>} (nvcc $(detect_nvcc_version), CUDA_HOME=${CUDA_HOME:-<系统默认>})" | tee -a "$LOG_FILE"
   echo ">> 启动命令: ${LAUNCH_CMD[*]}" | tee -a "$LOG_FILE"
 

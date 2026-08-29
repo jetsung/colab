@@ -15,12 +15,12 @@
 |---|---|---|---|
 | `colab.sh vps` | 根目录 | 宿主机 | 安装 Google Colab CLI，创建 GPU 会话并挂载 Google Drive |
 | `colab.sh setup` | 根目录 | Colab terminal | 前置依赖安装：direnv、bore、relaydrop、opencode |
-| `colab.sh install sglang` | 根目录 | Colab terminal | 装环境：装 uv → 建 Python 3.12 venv → 装 SGLang（含已知坑修复）；**不自动启动服务**，启动请另跑 `./launch.sh start` |
+| `colab.sh install sglang` | 根目录 | Colab terminal | 装环境：装 uv → 建 Python 3.12 venv（默认 `/tmp/sglang/venv`，**项目外**）→ 装 SGLang（含已知坑修复）；**不自动启动服务**，启动请另跑 `./launch.sh start` |
 | `launch.sh` | `sglang/` | Colab terminal | 服务管理：`start` / `stop` / `restart` / `status` / `logs` / `keep`（守护） |
 | `.envrc` | `sglang/` | Colab terminal | direnv：继承根 `.envrc`，按 `GPU_PROFILE`（或自动探测）加载 `.env.g4`/`.env.t4`，并声明 `SGLANG_*` 空默认（留空即自动推导） |
 | `.env.g4` / `.env.t4` | `sglang/` | Colab terminal | GPU profile（`SGLANG_MEM_FRACTION_STATIC` / `SGLANG_CTX` 等；架构由 launch.sh 自动探测） |
 | `colab.sh bore` | 根目录 | Colab terminal | bore 公网隧道：`30000 → ${BORE_PORT:-65535}`，setsid 后台托管，日志 `logs/bore.log` |
-| `sglang.ipynb` | `sglang/` | Colab | 部署流程 Notebook 版：等价于在 terminal 依次执行 setup/install/launch/bore，另含 .env 加载、就绪等待与 API 验证单元格；上传后 Run All 即可，项目路径可自定义（第 0 节填写）或按 环境变量→工作目录→子目录→Drive 自动探测 |
+| `sglang.ipynb` | `sglang/` | Colab | 部署流程 Notebook 版：等价于在 terminal 依次执行 `colab.sh setup all` / `colab.sh install sglang` / `colab.sh sglang start` / `colab.sh bore start`，另含 .env 加载、就绪等待与 API 验证单元格；上传后 Run All 即可，项目路径可自定义（第 0 节填写）或按 环境变量→工作目录→子目录→Drive 自动探测 |
 | `.envrc`（根） | 根目录 | Colab terminal | direnv 入口：`PATH_add`、`API_KEY` / `MODEL_REPO` / `BORE_PORT` 默认值、`dotenv` 加载 `.env`（`.env` 不入 git） |
 | `.env` | 根目录 | — | 实际密钥/凭据值（bore / relaydrop / SGLang / opencode），已被 `.gitignore` 忽略 |
 | `DOCS.md` | 根目录 | — | 完整部署教程（llama.cpp / SGLang）：安装坑修复、参数详解、API 示例、FAQ |
@@ -36,6 +36,7 @@
 source ~/.bashrc
 
 # 2. 安装 SGLang 环境(uv → venv → sglang; 不自动启动)
+#    venv 默认建在项目外 /tmp/sglang/venv, 换位置用 SGLANG_VENV_DIR=<路径>
 #    需先在根目录 .env 中写入密钥(SGLANG_API_KEY 或 API_KEY, 未设置时启动会报错)
 ./colab.sh install sglang
 
@@ -122,6 +123,9 @@ print(resp.choices[0].message.content)            # 最终回答
 | 变量 | 说明 |
 |---|---|
 | `SGLANG_MODEL_REPO` | 模型路径（HF ID 或本地路径）；未设置时回退 `MODEL_REPO`（默认 `Qwen/Qwen3.8-27B`）；**两者均空时启动报错** |
+| `MODEL_ROOT` | 模型基础盘前缀（根 `.envrc`，默认 `/content/models`，**两引擎共用**）；换持久化盘改这一处即可 |
+| `SGLANG_MODEL_ROOT` | sglang 侧基础盘前缀，未设置时回退 `MODEL_ROOT`（再兜底 `/content/models`） |
+| `SGLANG_MODEL_DIR` | 本仓库模型目录，默认 `<ROOT>/<repo名>`（按仓库隔离）；显式设置则原样使用、不再拼 ROOT。HF ID 启动时权重会 `hf download` 到该目录（持久化），命中已有目录则离线直接启动，下载失败仅告警并回退 HF ID |
 | `SGLANG_SERVED_NAME` | API 中的模型别名，默认=模型路径末段（小写、斜杠转连字符） |
 | `SGLANG_HOST` / `SGLANG_PORT` | 监听地址与端口（默认 `0.0.0.0` / `30000`） |
 | `SGLANG_CTX` | 最大上下文长度，默认 `0`=由 `config.json` 的 `max_position_embeddings` 自动推导；显式设正值可覆盖 |
@@ -134,6 +138,7 @@ print(resp.choices[0].message.content)            # 最终回答
 | `SGLANG_MAMBA_FULL_MEMORY_RATIO` | mamba 状态缓存占比（默认 0.6）；mamba 模型实际并发 ≈ `max_mamba_cache_size/4`，调大提升并发、相应缩小 KV 池 |
 | `SGLANG_MEM_FRACTION_STATIC` | 静态显存占比（默认 0.90；G4/T4 profile 提供 0.85/0.80，防 OOM） |
 | `FLASHINFER_CUDA_ARCH_LIST` | FlashInfer JIT 目标架构（默认按 `nvidia-smi` 探测并加正确后缀：Blackwell→`12.0f`、Ada→`8.9`、Turing→`7.5`；不建议手动改） |
+| `SGLANG_VENV_DIR` | Python venv 目录（默认 `/tmp/sglang/venv`，**项目外**，避免数 GB 依赖混进项目目录不便复制）；`colab.sh install sglang` 与 `launch.sh` 共用同一默认值，改了要两边一致（用环境变量改即可自动一致） |
 | `BORE_SECRET` / `BORE_SERVER` | bore 隧道凭据与中继服务器 |
 | `RELAYDROP_RELAY` / `RELAYDROP_PASSWORD` | relaydrop 凭据 |
 | `OPENCODE_API_KEY` | opencode 客户端密钥 |
@@ -172,7 +177,7 @@ cd /content/colab                    # 项目根目录
 ./bench.py -n 32 --max-tokens 256            # 默认连 localhost:30000, 引擎与模型自动识别
 ./bench.py -n 64 --port 30000 --model qwen3.8-27b
 
-# 等价入口(自动经 direnv 加载密钥)
+# 等价入口(继承当前 shell 环境, 密钥由外层 direnv / 手动 export 提供)
 ./colab.sh sglang bench -n 64 --max-tokens 256
 make sglang-bench BENCH_ARGS="-n 64 --max-tokens 256"
 ```

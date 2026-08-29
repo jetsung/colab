@@ -72,7 +72,41 @@ cd llama
 ./launch.sh start
 ```
 
-脚本会：校验必要变量 → 若本地缺模型则自动下载（首次约 74GB）→ 用 `llama-server` 后台加载并监听 `0.0.0.0:30000`。
+脚本会：校验必要变量 → 自适应解析模型（见下）→ 用 `llama-server` 后台加载并监听 `0.0.0.0:30000`。
+
+### 自适应模型解析（不写死路径形式）
+
+不同 GGUF 仓库的量化文件布局并不一致，脚本先扫本地、不足再拉**仓库文件清单**自动推导，无需改代码：
+
+| 仓库 | 真实布局 | 示例文件 |
+|------|----------|----------|
+| `unsloth/Qwen3.8-Flash-Next-GGUF` | 子目录 + 分片 | `UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf` |
+| `unsloth/Qwen3.8-27B-GGUF` | 根目录单文件 | `Qwen3.8-27B-UD-Q4_K_XL.gguf` |
+| （其他仓库） | 根目录 + 分片 | `xxx-Q4_K_M-00001-of-00002.gguf` |
+
+流程：
+
+1. 扫描 `LLAMA_MODEL_DIR`（深度 2），按 `LLAMA_QUANT` 匹配 `*-<QUANT>.gguf` / `*-<QUANT>-<5位序号>-of-<5位总数>.gguf`；
+   分片序号 1..N 齐全 → 直接启动，**不联网**。
+2. 不齐全 → 拉取 HF 仓库文件清单（`HF_TOKEN` / `HF_ENDPOINT` 生效），按同一规则归组，推导：
+   布局目录、模型名前缀（`--alias`）、分片总数、待下载文件清单、mmproj 路径。
+   多个候选时优先级：分片完整 > `<QUANT>/` 子目录 > 根目录 > 其他目录。
+3. 按推导出的**精确文件清单**下载（`hf download --include`，不再用通配符目录），
+   因此不会误下载 `imatrix` / `MTP` / 其他量化档。
+4. `mmproj`：本地已有则直接用；否则按清单精确路径下载（同仓库），跨仓库时回退 `mmproj-*.gguf` 匹配。
+
+量化档不存在时会打印该仓库**可用档位**清单，例如：
+
+```
+ERROR: 仓库 unsloth/Qwen3.8-27B-GGUF 中未找到量化档 NOPE 的 .gguf 文件。可用档位: BF16, Q4_0, ..., UD-Q8_K_XL
+```
+
+切换仓库/档位（`.env.g4` 内已给出注释开关）：
+
+```bash
+LLAMA_MODEL_REPO=unsloth/Qwen3.8-27B-GGUF ./launch.sh start   # 27B（根目录单文件布局）
+LLAMA_QUANT=UD-Q2_K_XL ./launch.sh start                      # 换个量化档
+```
 
 服务管理（与 `sglang/launch.sh` 一致）：
 
@@ -92,9 +126,11 @@ cd llama
 | 变量 | 默认/回退 | 说明 |
 |------|-----------|------|
 | `LLAMA_MODEL_REPO` | 回退 `MODEL_REPO` | HF 仓库（**不可为空**） |
-| `LLAMA_MODEL_NAME` | 从 REPO 提取（`/` 后去 `-GGUF`） | 模型名前缀（分片文件匹配） |
+| `LLAMA_MODEL_NAME` | 从 REPO 提取（`/` 后去 `-GGUF`） | 模型名（仅作别名与匹配提示；未显式设置时别名改用清单推导结果） |
 | `LLAMA_QUANT` | 无默认（**不可为空**） | 量化档位（由 `.env.g4`/`.env.t4` 或命令行提供） |
-| `LLAMA_MODEL_DIR` | `/content/models/<repo名>/<quant>` | 本地模型目录 |
+| `LLAMA_MODEL_ROOT` | 回退 `MODEL_ROOT`（根 `.envrc`，默认 `/content/models`，两引擎共用） | 模型基础盘前缀（换持久化盘只改这一层） |
+| `LLAMA_MODEL_DIR` | `<ROOT>/<repo名>` | 本仓库模型目录（显式设置则原样使用，不再拼 ROOT；其下按仓库真实结构存放） |
+| `HF_ENDPOINT` | `https://huggingface.co` | HF 端点（镜像站可覆盖；文件清单与 `hf download` 均遵循） |
 | `LLAMA_SERVER` | `/content/llama.cpp/build/bin/llama-server` | llama-server 二进制路径 |
 | `LLAMA_HOST` / `LLAMA_PORT` | `0.0.0.0` / `30000` | 监听地址与端口 |
 | `LLAMA_CTX` / `LLAMA_NGL` | `0` / `999` | 上下文长度（0=自动按空闲显存拟合）/ GPU 层数 |
@@ -144,7 +180,7 @@ curl http://localhost:30000/v1/chat/completions \
 cd /content/colab
 ./bench.py --engine llama -n 8 --max-tokens 256
 
-# 等价入口(自动经 direnv 加载密钥)
+# 等价入口(继承当前 shell 环境, 密钥由外层 direnv / 手动 export 提供)
 ./colab.sh llama bench -n 8 --max-tokens 256
 make llama-bench BENCH_ARGS="-n 8 --max-tokens 256"
 ```
@@ -195,7 +231,10 @@ colab/
 └── /content/
     ├── llama.cpp/      # 源码与编译产物（build/bin/llama-server）
     └── models/
-        └── Qwen3.8-Flash-Next-GGUF/
-            ├── UD-Q2_K_XL/   # 3 个 .gguf 分片（~74GB）
-            └── UD-Q4_K_XL/   # 4 个 .gguf 分片（~105GB，实测单卡可跑）
+        ├── Qwen3.8-Flash-Next-GGUF/     # 子目录 + 分片布局
+        │   ├── UD-Q2_K_XL/   # 3 个 .gguf 分片（~74GB）
+        │   └── UD-Q4_K_XL/   # 4 个 .gguf 分片（~105GB，实测单卡可跑）
+        └── Qwen3.8-27B-GGUF/            # 根目录单文件布局
+            ├── Qwen3.8-27B-UD-Q4_K_XL.gguf
+            └── mmproj-F16.gguf          # 视觉投影器（LLAMA_VISION 开启时下载）
 ```

@@ -10,6 +10,7 @@
 #   llama start|stop|restart|status|test|bench|logs|keep   Colab 内: llama.cpp 服务管理(透传 llama/launch.sh)
 #   sglang start|stop|restart|status|test|bench|logs|keep  Colab 内: SGLang 服务管理(透传 sglang/launch.sh)
 #   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
+#   sync pull|push|all [模型名...]        Colab 内: 手动同步本地工作盘 <-> Drive 冷存储(引擎不会自动复制; 见 sync -h)
 #
 # 全局:
 #   help | -h | --help                    查看本帮助
@@ -41,10 +42,13 @@ usage_root() {
   llama start|stop|restart|status|test|bench|logs|keep   Colab 内: llama.cpp 服务管理(动作见 llama -h)
   sglang start|stop|restart|status|test|bench|logs|keep  Colab 内: SGLang 服务管理(动作见 sglang -h)
   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
+  sync pull|push|all [模型名...]        Colab 内: 手动同步本地工作盘 <-> Drive 冷存储(引擎不会自动复制; 见 sync -h)
   help | -h | --help                    查看本帮助
 
 环境变量(可被参数覆盖):
-  DEBUG=1        开启执行追踪(set -eux)
+  MODEL_DRIVE_ROOT   Drive 冷存储根目录(仅 sync 使用), 默认 /content/drive/MyDrive/hf-models
+  MODEL_LOCAL_ROOT   本地工作盘根目录(仅 sync 使用), 默认 /content/models
+  DEBUG=1            开启执行追踪(set -eux)
 EOF
 }
 
@@ -379,21 +383,8 @@ do_install() {
 
 # ---------------- install llama: 源码编译(PR #27742, 支持 Qwen3.8-Flash-Next) ----------------
 install_llama_build() {
-  # 环境变量统一由 direnv 管理: cd 进 llama/ 目录并批准 .envrc 后注入当前 shell
-  # (.envrc 含 source_up 继承根配置 + GPU 探测自动加载 .env.<g4|t4>),
-  # 替代原 load_llama_profile 的手动 profile 加载逻辑
-  cd "${SCRIPT_DIR}/llama"
-  if command -v direnv >/dev/null 2>&1; then
-    direnv allow . || true      # 批准本目录 .envrc(幂等)
-    direnv allow .. || true     # 根 .envrc 需一并批准(source_up 继承)
-    # direnv hook 仅在交互式 cd 时自动触发, 脚本内需显式注入环境变量
-    # shellcheck disable=SC1090
-    eval "$(direnv export bash)" || \
-      echo "警告: direnv 环境加载失败, 使用默认值/自动探测" >&2
-  else
-    echo "警告: 未检测到 direnv, LLAMA_* 环境变量需已手动设置" >&2
-  fi
-
+  # 环境变量继承调用方 shell(外层 direnv hook 已注入); 脚本内不再自行调用 direnv。
+  # 缺失项走各自的兜底: LLAMA_CUDA_ARCH -> detect_arch(), LLAMA_DIR -> 下方默认值
   local LLAMA_DIR="${LLAMA_DIR:-/content/llama.cpp}"
   local PR_NUM=27742
   local PR_REF="refs/pull/${PR_NUM}/head"
@@ -568,8 +559,9 @@ print(release.get("tag_name", "未知"), asset["browser_download_url"], sep="\t"
 
 # ----------------------- install sglang: venv + SGLang -----------------------
 install_sglang() {
-  local WORKDIR="${SCRIPT_DIR}/sglang"                          # 工作目录 = sglang/ 子目录
-  local VENV_DIR="${WORKDIR}/.venv"
+  # venv 默认建在项目外(/tmp/sglang/venv): 依赖数 GB, 放项目里会让目录难以复制/备份。
+  # 默认值需与 sglang/launch.sh 保持一致, 可用 SGLANG_VENV_DIR 覆盖
+  local VENV_DIR="${SGLANG_VENV_DIR:-/tmp/sglang/venv}"
 
   # 关键修复: FlashInfer 在 pip 安装/编译阶段就会探测 CUDA 架构,
   # 必须在安装前导出, 否则会误读 nvcc 版本导致 sm_120 检测失败
@@ -584,10 +576,9 @@ install_sglang() {
   fi
   command -v uv >/dev/null 2>&1 || { echo "uv 安装后仍不可用, 请检查 PATH" >&2; exit 1; }
 
-  echo "==> [2/4] 创建虚拟环境 (Python 3.12)"
-  cd "$WORKDIR"
+  echo "==> [2/4] 创建虚拟环境 (Python 3.12) → ${VENV_DIR}"
   if [ ! -d "$VENV_DIR" ]; then
-    uv venv .venv --python 3.12
+    uv venv "$VENV_DIR" --python 3.12        # 父目录由 uv 自动创建
   fi
   # shellcheck disable=SC1091
   source "${VENV_DIR}/bin/activate"
@@ -600,9 +591,227 @@ install_sglang() {
   echo "==> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/sglang/launch.sh start"
 }
 
+# ============================== sync 子命令 ==================================
+# 本地工作盘 <-> Drive 冷存储 双向同步(按模型目录逐个 rsync)
+#   pull   Drive -> 本地盘
+#   push   本地盘 -> Drive
+#   all    先 pull 再 push —— 两边各取较新的一方, 即"互相同步"
+#
+# 安全约定(权重是几十 GB 的资产, 宁可少同步也绝不覆盖/删除更新的那一份):
+#   -u(--update)  目标端已有且比源端新的文件一律跳过, 双向都不会用旧版本覆盖新版本
+#   不使用 --delete  目标端多出来的文件保留; 本命令只补不删
+#   --exclude='.cache/'  HF 下载产生的 .cache 是本地续传用的临时数据, 不参与同步
+#   --quant <档位>       从云端(Drive)取回时通常只需某一个量化档: 加 --quant 则只同步
+#                        *-<档位>-*.gguf / *-<档位>.gguf, 免得把其它档位一起搬下来
+# 源目录不存在(该模型只在另一端)时跳过, 不报错。
+
+# 两端根目录: Drive 端用独立的 MODEL_DRIVE_ROOT, 不沿用引擎的 MODEL_ROOT ——
+# 后者是引擎的本地模型盘(指向 /content/drive 时引擎启动会报错), 两者语义不同不能混用。
+# 引擎不会自动在 Drive 与本地盘之间复制任何文件, 搬运只经本子命令手动触发。
+MODEL_DRIVE_ROOT="${MODEL_DRIVE_ROOT:-/content/drive/MyDrive/hf-models}"
+MODEL_LOCAL_ROOT="${MODEL_LOCAL_ROOT:-/content/models}"
+
+usage_sync() {
+  cat <<EOF
+用法: colab.sh sync <动作> [模型名...]
+
+  本地工作盘 <-> Drive 冷存储 双向同步(逐个模型目录 rsync)
+
+动作:
+  pull   Drive -> 本地盘(把冷存储里的模型取到本地)
+  push   本地盘 -> Drive(把本地下载好的模型存进冷存储)
+  all    先 pull 再 push —— 两边各取较新的一方
+
+选项:
+  -q, --quant <档位>   只同步该量化档的 gguf(*-<档位>-*.gguf / *-<档位>.gguf);
+                       从 Drive 取回时常用, 免得把目录里 BF16 等其它档位一起搬下来。
+                       省略则同步整个模型目录(SGLang 的 safetensors 权重请省略)
+  -n, --dry-run       只预览要同步哪些文件, 不实际传输(大批量操作前建议先跑一次)
+  -h, --help          显示本帮助
+
+参数:
+  模型名...   只同步指定的模型目录(可多个, 名称即根目录下的子目录名); 省略则同步全部
+
+目录(可用环境变量覆盖):
+  Drive(冷存储)  MODEL_DRIVE_ROOT   = ${MODEL_DRIVE_ROOT}
+  本地工作盘     MODEL_LOCAL_ROOT  = ${MODEL_LOCAL_ROOT}
+
+安全:
+  使用 rsync -u, 目标端更新的文件不会被覆盖; 不使用 --delete, 目标端多余文件保留
+
+示例:
+  ./colab.sh sync pull -n                        # 预览 Drive 上有哪些模型会拉到本地
+  ./colab.sh sync pull Qwen3.8-27B-GGUF --quant UD-Q8_K_XL   # 只拉这一个量化档
+  ./colab.sh sync push Qwen3.8-27B-GGUF          # 把本地下好的权重回存到 Drive
+  ./colab.sh sync all                            # 双向各取较新的一方
+EOF
+}
+
+# 列出某端根目录下的一级子目录(模型目录名); 只取目录, 忽略散落的文件
+sync_list_models() {
+  local root="$1"
+  [[ -d "$root" ]] || return 0
+  find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+}
+
+sync_preflight() {
+  command -v rsync >/dev/null 2>&1 || {
+    echo "错误: 未找到 rsync, 请先安装: apt install -y rsync" >&2
+    exit 1
+  }
+  # 注: 本地工作盘目录不在这里校验 —— pull/all 时它是目标目录, 不存在应自动创建(见 do_sync)
+  [[ -d "$MODEL_DRIVE_ROOT" ]] || {
+    echo "错误: Drive 冷存储目录不存在(Drive 未挂载?): $MODEL_DRIVE_ROOT" >&2
+    echo "  挂载 Drive: $0 vps mount" >&2
+    exit 1
+  }
+  if [[ "$MODEL_DRIVE_ROOT" != /content/drive* ]]; then
+    echo "警告: MODEL_DRIVE_ROOT 不在 /content/drive 下, 确认这是 Drive 挂载点: $MODEL_DRIVE_ROOT" >&2
+  fi
+}
+
+# 同步单个模型目录: sync_one <动作名> <源目录> <目标目录> <dry-run:0|1>
+sync_one() {
+  local label="$1" src="$2" dst="$3" dry="$4"
+  if [[ ! -d "$src" ]]; then
+    echo "   跳过(源目录不存在): $src"
+    return 0
+  fi
+  echo "==> ${label}: $src"
+  echo "           -> $dst"
+  local -a opts=(-a -u -m --no-owner --no-group --exclude='.cache/')
+  # 指定量化档: 只放行该档的 gguf(分片与单文件两种命名), 其余一律排除。
+  # 过滤规则按顺序首个匹配生效: .cache 的排除已在前, --include='*/' 保证能下钻子目录。
+  if [[ -n "$SYNC_QUANT" ]]; then
+    opts+=(--include='*/' \
+           --include="*-${SYNC_QUANT}-*.gguf" \
+           --include="*-${SYNC_QUANT}.gguf" \
+           --exclude='*')
+    echo "   仅量化档: *-${SYNC_QUANT}-*.gguf / *-${SYNC_QUANT}.gguf"
+  fi
+  if [[ "$dry" == "1" ]]; then
+    opts+=(--dry-run --itemize-changes)
+  else
+    opts+=(--info=progress2)
+  fi
+  if [[ "$dry" == "1" ]]; then
+    rsync "${opts[@]}" "$src/" "$dst/"        # 预览结果走 stdout, 便于查看/保存
+  else
+    mkdir -p "$dst"
+    rsync "${opts[@]}" "$src/" "$dst/" >&2    # 进度条走 stderr
+  fi
+}
+
+# 按方向批量同步: sync_direction <动作名> <源根> <目标根> <模型名清单(换行分隔)> <dry-run:0|1>
+sync_direction() {
+  local label="$1" src_root="$2" dst_root="$3" names="$4" dry="$5"
+  local name cnt=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    sync_one "$label" "$src_root/$name" "$dst_root/$name" "$dry"
+    cnt=$((cnt + 1))
+  done <<<"$names"
+  echo ">> ${label} 完成: 处理 ${cnt} 个模型目录"
+}
+
+do_sync() {
+  local action="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  local dry=0
+  SYNC_QUANT=""
+  local -a models=()
+  # 每个分支自行 shift(不放在循环末尾): 带值选项 shift 2 后再多 shift 一次会在
+  # 参数耗尽时返回非零, 被 set -e 当成失败直接终止脚本(vps 子命令同款写法)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -q | --quant)
+        [[ $# -ge 2 ]] || { echo "错误: $1 需要一个值(量化档, 如 UD-Q8_K_XL)" >&2; exit 1; }
+        SYNC_QUANT="$2"
+        shift 2
+        ;;
+      -n | --dry-run)
+        dry=1
+        shift
+        ;;
+      -h | --help) usage_sync; exit 0 ;;
+      -*)
+        echo "错误: 未知参数 '$1' (sync 支持 -q/--quant, -n/--dry-run, -h/--help)" >&2
+        usage_sync
+        exit 1
+        ;;
+      *)
+        models+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  case "$action" in
+    "" )             usage_sync; exit 1 ;;
+    help | -h | --help) usage_sync ;;
+    pull | push | all) ;;
+    *)
+      echo "错误: 未知动作 '$action' (可选: pull | push | all)" >&2
+      usage_sync
+      exit 1
+      ;;
+  esac
+
+  sync_preflight
+
+  # 本地工作盘: pull/all 时它是目标目录(首次同步时通常还不存在, 自动创建);
+  # push 时它是源目录, 不存在说明没有可推送的模型, 直接报错。
+  # 必须早于下面的模型列表计算 —— 否则 push 时会先撞上"没有可同步的模型目录"而静默退出
+  if [[ "$action" == "push" ]]; then
+    [[ -d "$MODEL_LOCAL_ROOT" ]] || {
+      echo "错误: 本地工作盘目录不存在(没有可推送的模型): $MODEL_LOCAL_ROOT" >&2
+      exit 1
+    }
+  elif [[ "$dry" != "1" && ! -d "$MODEL_LOCAL_ROOT" ]]; then
+    echo ">> 创建本地工作盘目录: $MODEL_LOCAL_ROOT"
+    mkdir -p "$MODEL_LOCAL_ROOT"
+  fi
+
+  # 未指定模型名: 按方向列出该端全部模型目录; all 取两端并集
+  local names
+  if ((${#models[@]})); then
+    names="$(printf '%s\n' "${models[@]}")"
+  elif [[ "$action" == "all" ]]; then
+    names="$(printf '%s\n%s\n' "$(sync_list_models "$MODEL_DRIVE_ROOT")" \
+                                "$(sync_list_models "$MODEL_LOCAL_ROOT")" | sed '/^$/d' | sort -u)"
+  elif [[ "$action" == "pull" ]]; then
+    names="$(sync_list_models "$MODEL_DRIVE_ROOT")"
+  else
+    names="$(sync_list_models "$MODEL_LOCAL_ROOT")"
+  fi
+  [[ -n "$names" ]] || { echo ">> 两端都没有可同步的模型目录"; exit 0; }
+
+  echo "Drive(冷存储): $MODEL_DRIVE_ROOT"
+  echo "本地工作盘  : $MODEL_LOCAL_ROOT"
+  [[ -n "$SYNC_QUANT" ]] && echo "量化档      : $SYNC_QUANT"
+  [[ "$dry" == "1" ]] && echo "(预览模式 --dry-run: 不会实际传输)"
+  # 从云端取回时最容易踩的坑: 忘了指定档位, 把目录里几十 GB 的其它档位一起搬下来
+  if [[ -z "$SYNC_QUANT" && "$action" != "push" ]]; then
+    echo "提示: 未指定 --quant, 将同步整个模型目录(含所有量化档); 只要某一档请加 --quant <档位>"
+  fi
+
+  case "$action" in
+    pull)  sync_direction pull "$MODEL_DRIVE_ROOT" "$MODEL_LOCAL_ROOT" "$names" "$dry" ;;
+    push)  sync_direction push "$MODEL_LOCAL_ROOT" "$MODEL_DRIVE_ROOT" "$names" "$dry" ;;
+    all)
+      sync_direction pull "$MODEL_DRIVE_ROOT" "$MODEL_LOCAL_ROOT" "$names" "$dry"
+      sync_direction push "$MODEL_LOCAL_ROOT" "$MODEL_DRIVE_ROOT" "$names" "$dry"
+      ;;
+  esac
+}
+
 # ============================== llama / sglang 服务管理 ======================
 # 透传至对应引擎的 launch.sh(子命令: start/stop/restart/status/logs/keep)
-# 引擎依赖各自 .envrc 经 direnv 注入的环境变量(LLAMA_*/SGLANG_*), 需先进入对应目录加载
+# 环境变量一律继承调用方 shell(由外层 direnv hook 注入; 脚本不再自行调用 direnv):
+#   - 避免 direnv exec 按 DIRENV_DIFF 回滚调用方环境, 把手动 export 的 MODEL_ROOT / API_KEY
+#     等变量静默还原成 .envrc 默认值
+#   - GPU profile 里引擎专属的默认值(LLAMA_QUANT / SGLANG_MEM_FRACTION_STATIC 等)由 launch.sh
+#     自己兜底加载(见各 launch.sh 的 load_gpu_profile), 不依赖 direnv
 do_engine() {
   local engine="$1"
   shift || true
@@ -618,34 +827,16 @@ do_engine() {
   case "$action" in
     help | -h | --help | "") usage_engine "$engine"; [[ -n "$action" ]] && exit 0 || exit 1 ;;
     start | stop | restart | status | test | logs | keep)
-      # direnv exec 会进入目录并加载其 .envrc(source_up 继承根配置 + GPU profile)
-      if command -v direnv >/dev/null 2>&1; then
-        # 首次执行时 .envrc 可能未批准(blocked 报错), 自动 allow(幂等):
-        # 引擎目录 + 根目录( source_up 继承需要 ), allow 失败不阻塞
-        direnv allow "$dir" >/dev/null 2>&1 || true
-        direnv allow "$SCRIPT_DIR" >/dev/null 2>&1 || true
-        exec direnv exec "$dir" "$script" "$action" "${@:2}"
-      else
-        # 无 direnv 时降级: 直接执行(环境变量需已由外部提供)
-        echo "警告: 未检测到 direnv, 环境变量(LLAMA_*/SGLANG_*)需已手动设置" >&2
-        exec "$script" "$action" "${@:2}"
-      fi
+      exec "$script" "$action" "${@:2}"
       ;;
     bench)
       # 并发压测: 走根目录 bench.py(--engine 由本函数按引擎注入, 后续参数可覆盖)
-      # 同样经 direnv 加载环境, 以便读到 *_API_KEY
+      # 鉴权密钥等继承调用方环境(外层 direnv hook 或手动 export)
       # PYTHONDONTWRITEBYTECODE: 一次性脚本无需字节码缓存, 避免项目里留下 __pycache__
       # (等价 python3 -B; 想改到 /tmp 则用 PYTHONPYCACHEPREFIX=/tmp/pycache)
       export PYTHONDONTWRITEBYTECODE=1
       shift
-      if command -v direnv >/dev/null 2>&1; then
-        direnv allow "$dir" >/dev/null 2>&1 || true
-        direnv allow "$SCRIPT_DIR" >/dev/null 2>&1 || true
-        exec direnv exec "$dir" python3 "${SCRIPT_DIR}/bench.py" --engine "$engine" "$@"
-      else
-        echo "警告: 未检测到 direnv, 鉴权密钥需已手动设置" >&2
-        exec python3 "${SCRIPT_DIR}/bench.py" --engine "$engine" "$@"
-      fi
+      exec python3 "${SCRIPT_DIR}/bench.py" --engine "$engine" "$@"
       ;;
     *)
       echo "错误: 未知动作 '$action' (可选: start | stop | restart | status | test | bench | logs | keep)" >&2
@@ -796,6 +987,7 @@ main() {
     llama)   do_engine llama "$@" ;;
     sglang)  do_engine sglang "$@" ;;
     bore)    do_bore "$@" ;;
+    sync)    do_sync "$@" ;;
     help | -h | --help)
       usage_root
       ;;

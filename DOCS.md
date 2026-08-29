@@ -44,6 +44,7 @@
 - [B5 SGLang API 使用示例](#b5-sglang-api-使用示例)
 
 **通用**
+- [5. 模型存放：冷存储（Drive）vs 本地盘](#5-模型存放冷存储google-drive-vs-本地盘)
 - [6. 运维与监控](#6-运维与监控)
 - [7. 常见问题 FAQ](#7-常见问题-faq)
 
@@ -246,9 +247,12 @@ SGLang 默认发布 **CUDA 13** 版本。若 Colab 驱动足够（≥ 580，支�
 ### B1.1 创建虚拟环境（必须 Python 3.12，原因见下）
 
 ```bash
-cd <项目目录>
-uv venv .venv --python 3.12
+# venv 建在项目外(默认 /tmp/sglang/venv), 避免数 GB 依赖混进项目目录不便复制
+uv venv /tmp/sglang/venv --python 3.12
 ```
+
+> 路径由 `SGLANG_VENV_DIR` 控制（`colab.sh install sglang` 与 `sglang/launch.sh` 共用同一默认值
+> `/tmp/sglang/venv`）。手动执行上面这条命令时请与脚本保持一致，否则 `launch.sh` 找不到 venv。
 
 > **为什么不用系统的 Python 3.13？**
 > 依赖 `outlines-core==0.1.26` 只发布到 cp312 的预编译 wheel。Python 3.13 会回退源码编译，
@@ -257,8 +261,8 @@ uv venv .venv --python 3.12
 ### B1.2 安装
 
 ```bash
-source .venv/bin/activate
-uv pip install --prerelease=allow sglang
+source /tmp/sglang/venv/bin/activate
+env -u UV_SYSTEM_PYTHON uv pip install --prerelease=allow sglang
 ```
 
 ### B1.3 验证
@@ -336,6 +340,12 @@ cd sglang
 
 ```bash
 ./colab.sh install sglang
+```
+
+venv 默认建在**项目外**的 `/tmp/sglang/venv`（依赖数 GB，放项目里不便复制/备份），用 `SGLANG_VENV_DIR` 可改位置：
+
+```bash
+SGLANG_VENV_DIR=/content/venvs/sglang ./colab.sh install sglang
 ```
 
 并发压测（根目录 `bench.py`，sglang / llama.cpp 通用；参数透传）：
@@ -474,6 +484,69 @@ print(resp.choices[0].message.content)            # 回答
 
 ---
 
+## 5. 模型存放：冷存储（Google Drive）vs 本地盘
+
+> **结论：不要让引擎直接从 Drive 加载权重。** Drive 在 Colab 里是 FUSE 挂载，
+> 顺序读只有几十 MB/s 且抖动大；而 llama.cpp / SGLang 加载权重用的是 `mmap` 随机读，
+> 延迟在 FUSE 上会被放大 —— 30GB 的权重可能从数十秒变成十几分钟，表现得像卡死
+> （挂载再抖一下，进程还可能进入 uninterruptible sleep，kill 都杀不掉）。
+
+因此引擎**不支持把 Drive 用作模型目录**：模型目录（含通过 `MODEL_ROOT` / `LLAMA_MODEL_ROOT` /
+`SGLANG_MODEL_ROOT` 间接指向）以 `/content/drive` 开头时，`launch.sh start` 直接报错退出；
+脚本也**不会自动复制/降级**任何文件。Drive 只作为冷存储，权重的搬运完全由手动
+`./colab.sh sync` 完成（见下）。
+
+```bash
+# 根 .envrc（两引擎共用）—— 模型一律放本地盘
+export MODEL_ROOT="/content/models"                    # 本地模型盘：引擎从这里加载
+
+# ./colab.sh sync 专用（默认值即可用，无需显式设置）
+export MODEL_DRIVE_ROOT="/content/drive/MyDrive/hf-models"   # Drive 冷存储：只存权重
+export MODEL_LOCAL_ROOT="/content/models"                    # 本地工作盘：sync 的本地端
+```
+
+行为要点：
+
+| 场景 | 做法 |
+|---|---|
+| Drive 冷存储里有模型，本地没有 | `./colab.sh sync pull <模型名> --quant <档位>` 拉到本地盘后再启动 |
+| 本地下好了模型，要持久化到 Drive | `./colab.sh sync push <模型名>` 回存冷存储 |
+| 引擎启动 | 只读本地盘（`MODEL_ROOT`），不读 Drive，不自动复制 |
+
+### 手动双向同步：`./colab.sh sync`
+
+`sync` 是本地盘与 Drive 冷存储之间唯一的搬运途径（逐个模型目录 rsync，手动触发）：
+
+```bash
+./colab.sh sync pull -n                        # 预览：Drive 上有哪些模型会拉到本地
+./colab.sh sync pull Qwen3.8-27B-GGUF --quant UD-Q8_K_XL   # 只拉这一个量化档（推荐）
+./colab.sh sync push Qwen3.8-27B-GGUF          # 把本地下好的权重回存到 Drive
+./colab.sh sync all                            # 双向各取较新的一方（先 pull 再 push）
+```
+
+**从云端取回时请带 `--quant <档位>`**：只同步 `*-<档位>-*.gguf` / `*-<档位>.gguf`，
+免得把目录里 BF16 等几十 GB 的其它档位一起搬下来。省略 `--quant` 会同步整个模型目录，
+此时脚本会打印提示——SGLang 的 safetensors 权重没有档位概念，那种情况就该省略。
+
+| 动作 | 方向 |
+|---|---|
+| `pull` | Drive → 本地盘 |
+| `push` | 本地盘 → Drive |
+| `all` | 先 pull 再 push，两边各取较新的一方 |
+
+安全约定（权重是几十 GB 的资产，宁可少同步也绝不覆盖/删除更新的那一份）：
+- 全程 `rsync -u`：**目标端已有且比源端新的文件一律跳过**，双向都不会用旧版本覆盖新版本；
+- **不用 `--delete`**：目标端多出来的文件保留，只补不删；
+- 跳过 `.cache/`（HF 下载产生的临时数据，本地续传用，不参与同步）；
+- 源目录不存在（该模型只在另一端）时跳过不报错。
+
+建议大批量操作前先加 `-n/--dry-run` 预览（预览不会创建任何目录、不传输任何文件）。
+
+`pull` / `all` 在本地工作盘目录不存在时会自动创建（首次同步的常见情况）；`push` 时本地盘是源
+目录，不存在则报错——没有模型可推。
+
+---
+
 ## 6. 运维与监控
 
 ```bash
@@ -539,3 +612,9 @@ FlashInfer 首次 JIT 编译内核（几分钟，之后有缓存）；llama.cpp 
 - llama.cpp：增大 `--ctx-size`（显存有限，配合 YARN/rope-scaling 可外推）；
 - SGLang：`--context-length` 按模型自动推导，可用 `SGLANG_CTX` 覆盖（默认 0=自动）；
   但上下文越长 KV 越占显存，需在显存范围内权衡。
+
+**Q13: 模型放在 Google Drive，加载特别慢 / 看着像卡死？**
+权重不该从 Drive 加载（FUSE 上的 mmap 随机读极慢），引擎也**不支持** Drive 作为模型目录——
+模型目录以 `/content/drive` 开头时启动直接报错。先用 `./colab.sh sync pull <模型名>
+--quant <档位>` 把权重取到本地盘（默认 `/content/models`）再启动。详见
+[第 5 节](#5-模型存放冷存储google-drive-vs-本地盘)。
