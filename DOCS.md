@@ -1,29 +1,30 @@
-# Google Colab 部署大模型完整教程（llama.cpp / SGLang）
+# Google Colab 部署大模型完整教程（llama.cpp / SGLang / vLLM）
 
 > 目标环境：**Google Colab**（GPU 会话，可能是 **G4** 或 **T4** 显卡）/ Ubuntu Linux
 > 服务形态：OpenAI 兼容 API，支持深度思考、工具调用、投机解码等
 >
-> 本教程提供 **两套可选推理引擎**：
+> 本教程提供 **三套可选推理引擎**：
 > - **llama.cpp**：单文件 `llama-server`，GGUF 模型，显存占用低、上手快，适合 G4/T4 有限显存；
-> - **SGLang**：Python 生态，高吞吐、多功能（深度思考 / 工具调用 / EAGLE 投机解码）。
+> - **SGLang**：Python 生态，高吞吐、多功能（深度思考 / 工具调用 / EAGLE 投机解码）；
+> - **vLLM**：Python 生态，直接运行 Hugging Face 模型，使用官方 `vllm serve` 提供高吞吐 OpenAI 兼容服务。
 >
-> 两者都能对外提供 OpenAI 兼容 API，可按需求二选一（见下方「如何选择」）。
+> 三者都能对外提供 OpenAI 兼容 API，可按需求选择（见下方「如何选择」）。
 
 ---
 
 ## 如何选择
 
-| 维度 | llama.cpp | SGLang |
-|---|---|---|
-| 安装 | 编译 CUDA 版或下载预编译二进制 | `pip install sglang`（Python venv） |
-| 模型格式 | **GGUF**（需量化/转换） | HF safetensors（原格式直接跑） |
-| 显存占用 | 低（GGUF 量化到 Q4 等） | 中等（fp8 KV 量化） |
-| 上手难度 | ★（单命令启动） | ★★★（参数多、自动推导） |
-| 深度思考 / 工具调用 | 支持（需对应模板） | 支持（解析器更完善） |
-| 高并发 / 高吞吐 | 一般 | 强（连续 batching、投机解码） |
-| 适用场景 | G4/T4 低显存、快速起服务 | 追求性能、多并发、复杂功能 |
+| 维度 | llama.cpp | SGLang | vLLM |
+|---|---|---|---|
+| 安装 | 编译 CUDA 版或下载预编译二进制 | `pip install sglang`（Python venv） | 官方最新 vLLM（Python venv） |
+| 模型格式 | **GGUF**（需量化/转换） | HF safetensors（原格式直接跑） | HF safetensors（原格式直接跑） |
+| 显存占用 | 低（GGUF 量化到 Q4 等） | 中等（fp8 KV 量化） | 由 `--gpu-memory-utilization` 控制 |
+| 上手难度 | ★（单命令启动） | ★★★（参数多、自动推导） | ★★（官方 `vllm serve`） |
+| 深度思考 / 工具调用 | 支持（需对应模板） | 支持（解析器更完善） | 随模型和 vLLM 版本支持 |
+| 高并发 / 高吞吐 | 一般 | 强（连续 batching、投机解码） | 强（连续 batching） |
+| 适用场景 | G4/T4 低显存、快速起服务 | 追求性能、多并发、复杂功能 | HF 模型、高吞吐、标准 API |
 
-> 简单判断：**图省事、显存小 → llama.cpp**；**要性能/并发/多模型功能 → SGLang**。
+> 简单判断：**图省事、显存小 → llama.cpp**；**要 SGLang 特性 → SGLang**；**要标准 vLLM 服务 → vLLM**。
 
 ---
 
@@ -42,6 +43,13 @@
 - [B3 启动脚本](#b3-启动脚本)
 - [B4 SGLang 参数详解](#b4-sglang-参数详解)
 - [B5 SGLang API 使用示例](#b5-sglang-api-使用示例)
+
+**Part C：vLLM**
+- [C1 安装 vLLM](#c1-安装-vllm)
+- [C2 vLLM 启动脚本](#c2-vllm-启动脚本)
+- [C3 vLLM 参数详解](#c3-vllm-参数详解)
+- [C4 vLLM API 与监控](#c4-vllm-api-与监控)
+- [C5 vLLM 压测与调优](#c5-vllm-压测与调优)
 
 **通用**
 - [5. 模型存放：冷存储（Drive）vs 本地盘](#5-模型存放冷存储google-drive-vs-本地盘)
@@ -484,6 +492,136 @@ print(resp.choices[0].message.content)            # 回答
 
 ---
 
+# Part C：vLLM
+
+## C1. 安装 vLLM
+
+项目通过 uv 创建独立的 Python 3.12 venv，并按官方 quickstart 用 `--torch-backend=auto` 自动选择匹配后端，安装最新 vLLM，不固定版本：
+
+```bash
+./colab.sh install vllm
+```
+
+默认 venv 为 `/tmp/vllm/venv`，可通过 `VLLM_VENV_DIR` 修改：
+
+```bash
+VLLM_VENV_DIR=/content/venvs/vllm ./colab.sh install vllm
+```
+
+安装脚本会在完成后验证 `vllm serve --help`。vLLM 对 Python、PyTorch、CUDA 驱动和 GPU 架构较敏感；如果官方最新版本与当前 Colab 驱动不兼容，应根据驱动环境选择合适的 vLLM/CUDA 安装组合，而不是复用 SGLang 的 venv。
+
+## C2. vLLM 启动脚本
+
+`vllm/launch.sh` 使用官方推荐的 `vllm serve`，并提供与 SGLang 对称的服务管理：
+
+```bash
+./colab.sh vllm start
+./colab.sh vllm stop
+./colab.sh vllm restart
+./colab.sh vllm status
+./colab.sh vllm test
+./colab.sh vllm logs
+./colab.sh vllm keep
+```
+
+启动前会把 HF ID 下载到本地模型目录；已有 `config.json` 时直接复用，不会让 vLLM 在后台把权重下载到不可控位置。服务默认监听 `0.0.0.0:30000`，日志为 `logs/vllm_server.log`，启动命令追加记录到 `logs/launch_cmd.log`。
+
+示例：
+
+```bash
+export VLLM_MODEL_REPO=Qwen/Qwen3-8B
+export VLLM_API_KEY=sk-your-key
+./colab.sh vllm start
+./colab.sh vllm status
+```
+
+`VLLM_API_KEY` 未设置时回退 `API_KEY`；显式设置 `VLLM_API_KEY=""` 可关闭鉴权。两个变量都未设置时，`start` 会拒绝启动，避免无意中暴露公网服务。
+
+## C3. vLLM 参数详解
+
+启动脚本根据环境变量构造参数数组，避免 shell 字符串拼接造成参数错位：
+
+| vLLM 参数 | 环境变量 | 说明 |
+|---|---|---|
+| `--model`（位置参数） | `VLLM_MODEL_REPO` | HF 模型 ID 或本地模型目录 |
+| `--served-model-name` | `VLLM_SERVED_NAME` | API 中的模型名，默认取路径末段小写 |
+| `--host` / `--port` | `VLLM_HOST` / `VLLM_PORT` | 默认 `0.0.0.0:30000` |
+| `--api-key` | `VLLM_API_KEY` / `API_KEY` | Bearer 鉴权；空值不传参数 |
+| `--gpu-memory-utilization` | `VLLM_GPU_MEMORY_UTILIZATION` | GPU 显存使用比例；G4 默认 0.90、T4 默认 0.80 |
+| `--max-model-len` | `VLLM_MAX_MODEL_LEN` | 最大上下文长度；留空使用模型/vLLM 默认值 |
+| `--max-num-seqs` | `VLLM_MAX_NUM_SEQS` | 限制并发序列数，默认 `512`；显存不足时可继续降低 |
+| `--max-num-batched-tokens` | `VLLM_MAX_NUM_BATCHED_TOKENS` | 限制单批 token，控制显存与延迟 |
+| `--tensor-parallel-size` | `VLLM_TENSOR_PARALLEL_SIZE` | 多 GPU 张量并行，默认 1 |
+| `--dtype` | `VLLM_DTYPE` | 默认 `auto`，也可用 `bfloat16` 等 |
+| `--quantization` | `VLLM_QUANTIZATION` | 可选量化后端 |
+| `--enable-prefix-caching` | `VLLM_ENABLE_PREFIX_CACHING=1` | 启用前缀缓存 |
+| `--trust-remote-code` | `VLLM_TRUST_REMOTE_CODE=1` | 模型需要自定义代码时显式开启 |
+| `--enforce-eager` | `VLLM_ENFORCE_EAGER=1` | CUDA graph 不兼容时排查使用 |
+| `--generation-config` | `VLLM_GENERATION_CONFIG` | 留空用模型 `generation_config.json`（默认）；设为 `vllm` 用 vLLM 默认采样参数 |
+| `--enable-auto-tool-choice` | `VLLM_ENABLE_AUTO_TOOL_CHOICE` | 自动工具调用，默认开启；设为 `0` 关闭 |
+| `--tool-call-parser` | `VLLM_TOOL_CALL_PARSER` | 工具调用解析器；留空时按 `config.json` 模型家族推导 |
+
+带 `tool_choice: "auto"` 的 coding agent 请求需要同时开启 `--enable-auto-tool-choice` 和 `--tool-call-parser`，否则 vLLM 返回 `400 --enable-auto-tool-choice and --tool-call-parser to be set`。脚本已默认开启两者；模型家族无法识别时会打印警告并跳过，此时用 `VLLM_TOOL_CALL_PARSER` 显式指定（如 `qwen3_coder`、`hermes`、`pythonic`）。
+
+例如显存不足时：
+
+```bash
+VLLM_MAX_MODEL_LEN=8192 \
+VLLM_GPU_MEMORY_UTILIZATION=0.75 \
+./colab.sh vllm restart
+```
+
+## C4. vLLM API 与监控
+
+vLLM 提供 OpenAI 兼容 API：
+
+```bash
+curl http://localhost:30000/v1/chat/completions \
+  -H "Authorization: Bearer $VLLM_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-8b",
+    "messages": [{"role": "user", "content": "你好"}],
+    "max_tokens": 256
+  }'
+```
+
+就绪和指标端点：
+
+```bash
+curl http://localhost:30000/health
+curl -H "Authorization: Bearer $VLLM_API_KEY" http://localhost:30000/metrics
+curl -H "Authorization: Bearer $VLLM_API_KEY" http://localhost:30000/v1/models
+```
+
+`/health` 返回 HTTP 200 表示服务已就绪。vLLM 原生提供 Prometheus `/metrics`，不需要添加 SGLang 的 `--enable-metrics` 参数；`bench.py` 采样 `num_requests_running` 和 `num_requests_waiting`。
+
+## C5. vLLM 压测与调优
+
+```bash
+./colab.sh vllm bench -n 8 --max-tokens 128
+make vllm-bench BENCH_ARGS="-n 8 --max-tokens 128"
+```
+
+压测请求走 `/v1/chat/completions`，模型未显式指定时从 `/v1/models` 自动获取。vLLM 开启 API key 时，压测脚本会将 `VLLM_API_KEY`（或 `--api-key`）带到 API 和 `/metrics` 请求中。
+
+调优顺序建议：
+
+1. 先选能完整放入本地 GPU 的 HF 模型/量化后端。
+2. OOM 时先降低 `VLLM_MAX_MODEL_LEN`，再降低 `VLLM_GPU_MEMORY_UTILIZATION` 或 `VLLM_MAX_NUM_SEQS`。
+3. 追求吞吐时在显存允许范围内增加并发和批 token 限制，并比较聚合 tok/s、最大延迟和 waiting 峰值。
+4. 使用 `VLLM_TRUST_REMOTE_CODE=1` 前确认模型仓库可信；默认不启用该选项。
+
+### 两个常见启动失败
+
+**`FlashInfer requires GPUs with sm75 or higher`**：Blackwell（SM 12.x）在系统 nvcc 较旧时会探测失败。`launch.sh` 会按 compute capability 与 nvcc 版本导出 `FLASHINFER_CUDA_ARCH_LIST`（SM 12.0 + nvcc ≥ 12.9 为 `12.0f`，否则 `12.0a`）；日志会打印实际取值。
+
+**`max_num_seqs (1024) exceeds available Mamba cache blocks`**：混合 mamba 模型需要为每个并发序列预留一个 Mamba cache block，vLLM 默认 1024 超过可用数量。脚本默认传 `--max-num-seqs 512`；仍失败时降低 `VLLM_MAX_NUM_SEQS`，或提高 `VLLM_GPU_MEMORY_UTILIZATION`。
+
+**`Unknown vLLM environment variable detected: VLLM_*`**：`VLLM_GPU_MEMORY_UTILIZATION` 等只是本脚本的配置项，会被 vLLM 当作未知环境变量告警。脚本启动服务时用 `env -u` 剥离这些变量（值已通过命令行参数传入），因此新启动日志不应再出现该告警。
+
+**`Default vLLM sampling parameters have been overridden by the model's generation_config.json`**：这是模型作者推荐的采样参数（Qwen 为 temperature 1.0 / top_k 20 / top_p 0.95），按默认保留即可；想改用 vLLM 默认采样时设 `VLLM_GENERATION_CONFIG=vllm`。
+
 ## 5. 模型存放：冷存储（Google Drive）vs 本地盘
 
 > **结论：不要让引擎直接从 Drive 加载权重。** Drive 在 Colab 里是 FUSE 挂载，
@@ -559,6 +697,11 @@ tail -f ./logs/sglang_server.log          # 日志(根目录 logs/)
 curl http://localhost:30000/health        # 健康
 curl http://localhost:30000/metrics       # Prometheus 指标
 
+# vLLM (端口 30000)
+tail -f ./logs/vllm_server.log            # 日志(根目录 logs/)
+curl http://localhost:30000/health        # 健康
+curl -H "Authorization: Bearer $VLLM_API_KEY" http://localhost:30000/metrics
+
 nvidia-smi                               # 显存占用
 ```
 
@@ -577,10 +720,11 @@ nvidia-smi                               # 显存占用
 
 **Q3: 显存不足（OOM）怎么办？**
 - llama.cpp：降 GGUF 量化（Q4）、减小 `--ctx-size`、减小 `-ngl`、降 `--parallel`；
-- SGLang：降 `--mem-fraction-static` 到 0.85、KV 用 fp8、换更小模型。
+- SGLang：降 `--mem-fraction-static` 到 0.85、KV 用 fp8、换更小模型；
+- vLLM：降低 `VLLM_MAX_MODEL_LEN`、`VLLM_GPU_MEMORY_UTILIZATION` 或 `VLLM_MAX_NUM_SEQS`，必要时换更小/量化模型。
 
-**Q4: 选 llama.cpp 还是 SGLang？**
-显存小/图省事选 llama.cpp；要性能、并发、深度思考/工具调用等完善功能选 SGLang。
+**Q4: 选 llama.cpp、SGLang 还是 vLLM？**
+显存小/图省事选 llama.cpp；要 SGLang 的解析器、投机解码等功能选 SGLang；要直接运行 HF 模型并使用标准 vLLM 服务选 vLLM。
 
 **Q5: SGLang 启动报 `FlashInfer requires GPUs with sm75 or higher`？**
 架构没传对，或 nvcc 太旧编不出 `compute_120f`：需 `FLASHINFER_CUDA_ARCH_LIST`（注意无
@@ -601,17 +745,17 @@ Mamba 状态缓存限制。调大 `--mamba-full-memory-ratio`（如 0.5），或
 若发现长文注意力异常，可去掉 `--kv-cache-dtype fp8_e4m3` 回退 bf16。
 
 **Q10: 首次请求特别慢？**
-FlashInfer 首次 JIT 编译内核（几分钟，之后有缓存）；llama.cpp 首次加载 GGUF 也需时间。
+FlashInfer 首次 JIT 编译内核（几分钟，之后有缓存）；llama.cpp 首次加载 GGUF、vLLM 首次加载权重和 CUDA graph warmup 也需时间。
 均属正常。
 
 **Q11: 请求返回 `401 Unauthorized`？**
 服务已启用 Bearer 鉴权，客户端必须带 `Authorization: Bearer <密钥>`。
-密钥由 `SGLANG_API_KEY`（回退 `API_KEY`，SGLang）或 `LLAMA_API_KEY`（回退 `API_KEY`，llama.cpp）决定。
+密钥由 `SGLANG_API_KEY`、`VLLM_API_KEY` 或 `LLAMA_API_KEY`（各自回退 `API_KEY`）决定。显式设置引擎密钥为空可关闭该引擎鉴权。
 
 **Q12: 上下文不够长？**
 - llama.cpp：增大 `--ctx-size`（显存有限，配合 YARN/rope-scaling 可外推）；
 - SGLang：`--context-length` 按模型自动推导，可用 `SGLANG_CTX` 覆盖（默认 0=自动）；
-  但上下文越长 KV 越占显存，需在显存范围内权衡。
+- vLLM：用 `VLLM_MAX_MODEL_LEN` 设置上限；上下文越长 KV 越占显存，需在显存范围内权衡。
 
 **Q13: 模型放在 Google Drive，加载特别慢 / 看着像卡死？**
 权重不该从 Drive 加载（FUSE 上的 mmap 随机读极慢），引擎也**不支持** Drive 作为模型目录——

@@ -4,9 +4,10 @@
 # 所有功能均透传给根目录 colab.sh(一体化入口):
 #   [宿主机]  vps:   install / create / sessions / mount / all
 #   [Colab]   setup: deps / bore / relaydrop / opencode / codebuddy / hint / all
-#   [Colab]   install: llama / sglang(安装并启用引擎环境)
+#   [Colab]   install: llama / sglang / vllm(安装并启用引擎环境)
 #   [Colab]   llama: start / stop / restart / status / test / logs / keep
 #   [Colab]   sglang: start / stop / restart / status / test / bench / logs / keep
+#   [Colab]   vllm: start / stop / restart / status / test / bench / logs / keep
 #   [Colab]   bore:  start / stop / restart / status / logs
 #
 # 实际逻辑见 colab.sh, 此处仅配置参数透传
@@ -30,9 +31,10 @@ BORE_PORT ?= 65535
 .PHONY: install create sessions mount all \
         setup setup-deps setup-tools setup-bore setup-relaydrop \
         setup-opencode setup-codebuddy setup-hint \
-        install-llama install-llama-build install-sglang \
+        install-llama install-llama-build install-sglang install-vllm \
         llama llama-start llama-stop llama-restart llama-status llama-test llama-bench llama-logs llama-keep \
         sglang sglang-start sglang-stop sglang-restart sglang-status sglang-test sglang-bench sglang-logs sglang-keep \
+        vllm vllm-start vllm-stop vllm-restart vllm-status vllm-test vllm-bench vllm-logs vllm-keep \
         bore bore-start bore-stop bore-restart bore-status bore-logs \
         help list
 
@@ -140,6 +142,10 @@ install-llama-build:
 install-sglang:
 	bash $(SCRIPT) install sglang
 
+## [Colab/install] install-vllm: 建 venv + 安装官方最新 vLLM(不自动启动)
+install-vllm:
+	bash $(SCRIPT) install vllm
+
 # ================== [Colab/llama] llama.cpp 服务管理 ==================
 
 ## [Colab/llama] llama: 默认动作(启动服务)
@@ -213,6 +219,43 @@ sglang-logs:
 ## [Colab/sglang] sglang-keep: 守护模式(崩溃自动拉起)
 sglang-keep:
 	bash $(SCRIPT) sglang keep
+
+# ================== [Colab/vllm] vLLM 服务管理 ==================
+
+## [Colab/vllm] vllm: 默认动作(启动服务)
+vllm: vllm-start
+
+## [Colab/vllm] vllm-start: 启动服务(后台 setsid 托管)
+vllm-start:
+	bash $(SCRIPT) vllm start
+
+## [Colab/vllm] vllm-stop: 停止服务
+vllm-stop:
+	bash $(SCRIPT) vllm stop
+
+## [Colab/vllm] vllm-restart: 重启服务
+vllm-restart:
+	bash $(SCRIPT) vllm restart
+
+## [Colab/vllm] vllm-status: 查看状态 + 健康检查
+vllm-status:
+	bash $(SCRIPT) vllm status
+
+## [Colab/vllm] vllm-test: 发送一条测试对话(需服务已就绪)
+vllm-test:
+	bash $(SCRIPT) vllm test
+
+## [Colab/vllm] vllm-bench: 并发压测(参数用 BENCH_ARGS 传, 如 -n 8 --max-tokens 256)
+vllm-bench:
+	bash $(SCRIPT) vllm bench $(BENCH_ARGS)
+
+## [Colab/vllm] vllm-logs: 跟踪日志
+vllm-logs:
+	bash $(SCRIPT) vllm logs
+
+## [Colab/vllm] vllm-keep: 守护模式(崩溃自动拉起)
+vllm-keep:
+	bash $(SCRIPT) vllm keep
 
 # ================== [Colab/bore] 公网隧道 ==================
 

@@ -6,9 +6,10 @@
 # 子命令:
 #   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
 #   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
-#   install <engine> [--build|-B]       Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
+#   install <engine> [--build|-B]       Colab 内: 安装并启用引擎环境(engine: llama | sglang | vllm; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
 #   llama start|stop|restart|status|test|bench|logs|keep   Colab 内: llama.cpp 服务管理(透传 llama/launch.sh)
 #   sglang start|stop|restart|status|test|bench|logs|keep  Colab 内: SGLang 服务管理(透传 sglang/launch.sh)
+#   vllm start|stop|restart|status|test|bench|logs|keep    Colab 内: vLLM 服务管理(透传 vllm/launch.sh)
 #   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
 #   sync pull|push|all [模型名...]        Colab 内: 手动同步本地工作盘 <-> Drive 冷存储(引擎不会自动复制; 见 sync -h)
 #
@@ -38,9 +39,10 @@ usage_root() {
 子命令:
   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
-  install <engine> [--build|-B]          Colab 内: 安装并启用引擎环境(engine: llama | sglang; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
+  install <engine> [--build|-B]          Colab 内: 安装并启用引擎环境(engine: llama | sglang | vllm; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
   llama start|stop|restart|status|test|bench|logs|keep   Colab 内: llama.cpp 服务管理(动作见 llama -h)
   sglang start|stop|restart|status|test|bench|logs|keep  Colab 内: SGLang 服务管理(动作见 sglang -h)
+  vllm start|stop|restart|status|test|bench|logs|keep    Colab 内: vLLM 服务管理(动作见 vllm -h)
   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
   sync pull|push|all [模型名...]        Colab 内: 手动同步本地工作盘 <-> Drive 冷存储(引擎不会自动复制; 见 sync -h)
   help | -h | --help                    查看本帮助
@@ -146,6 +148,7 @@ usage_install() {
               默认: 下载 GitHub 最新 prerelease 官方预编译二进制(ubuntu-x64, 通用版)
               --build / -B: 编译源码(支持 Qwen3.8-Flash-Next 的 PR #27742)
     sglang    建 venv + 装 SGLang(不自动启动, 启动请另跑 sglang/launch.sh)
+    vllm      建 venv + 装官方最新 vLLM(不自动启动, 启动请另跑 vllm/launch.sh)
 
 选项:
   --build, -B   llama 使用源码编译方式(默认下载 GitHub 最新 prerelease 通用预编译二进制; GPU CUDA 请用此选项)
@@ -368,13 +371,20 @@ do_install() {
       fi
       install_sglang
       ;;
+    vllm)
+      if [[ "$mode" == "build" ]]; then
+        echo "错误: vllm 不支持 --build(仅 llama 提供源码编译方式)" >&2
+        exit 1
+      fi
+      install_vllm
+      ;;
     help | -h | --help) usage_install ;;
     "")
       usage_install
       exit 1
       ;;
     *)
-      echo "错误: 未知引擎 '$engine' (可选: llama | sglang)" >&2
+      echo "错误: 未知引擎 '$engine' (可选: llama | sglang | vllm)" >&2
       usage_install
       exit 1
       ;;
@@ -591,6 +601,37 @@ install_sglang() {
   echo "==> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/sglang/launch.sh start"
 }
 
+# ----------------------- install vllm: venv + latest vLLM --------------------
+install_vllm() {
+  # vLLM 依赖较大，默认把 venv 放在项目外；VLLM_VENV_DIR 与 launch.sh 共用。
+  local VENV_DIR="${VLLM_VENV_DIR:-/tmp/vllm/venv}"
+
+  echo "==> [1/4] 检查 uv 与 Python 3.12"
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "未检测到 uv, 正在安装..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:${PATH}"
+  fi
+  command -v uv >/dev/null 2>&1 || { echo "uv 安装后仍不可用, 请检查 PATH" >&2; exit 1; }
+
+  echo "==> [2/4] 创建虚拟环境 (Python 3.12) → ${VENV_DIR}"
+  if [[ ! -d "$VENV_DIR" ]]; then
+    uv venv "$VENV_DIR" --python 3.12
+  fi
+  # shellcheck disable=SC1091
+  source "${VENV_DIR}/bin/activate"
+
+  echo "==> [3/4] 安装官方最新 vLLM"
+  # 清除 UV_SYSTEM_PYTHON, 确保依赖安装到当前 venv；按官方方式自动选择匹配的 PyTorch 后端，不固定 vLLM 版本。
+  env -u UV_SYSTEM_PYTHON uv pip install --upgrade vllm --torch-backend=auto
+
+  echo "==> [4/4] 验证 vllm serve"
+  command -v vllm >/dev/null 2>&1 || { echo "vLLM 安装后仍找不到 vllm 命令" >&2; exit 1; }
+  vllm serve --help >/dev/null
+  echo ""
+  echo "==> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/vllm/launch.sh start"
+}
+
 # ============================== sync 子命令 ==================================
 # 本地工作盘 <-> Drive 冷存储 双向同步(按模型目录逐个 rsync)
 #   pull   Drive -> 本地盘
@@ -805,7 +846,7 @@ do_sync() {
   esac
 }
 
-# ============================== llama / sglang 服务管理 ======================
+# ============================== llama / sglang / vllm 服务管理 =================
 # 透传至对应引擎的 launch.sh(子命令: start/stop/restart/status/logs/keep)
 # 环境变量一律继承调用方 shell(由外层 direnv hook 注入; 脚本不再自行调用 direnv):
 #   - 避免 direnv exec 按 DIRENV_DIFF 回滚调用方环境, 把手动 export 的 MODEL_ROOT / API_KEY
@@ -986,6 +1027,7 @@ main() {
     install) do_install "$@" ;;
     llama)   do_engine llama "$@" ;;
     sglang)  do_engine sglang "$@" ;;
+    vllm)    do_engine vllm "$@" ;;
     bore)    do_bore "$@" ;;
     sync)    do_sync "$@" ;;
     help | -h | --help)

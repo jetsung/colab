@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""本地推理服务并发压测(sglang / llama.cpp 通用, 仅用标准库, 无需额外依赖)。
+"""本地推理服务并发压测(sglang / llama.cpp / vLLM 通用, 仅用标准库)。
 
-请求层走 OpenAI 兼容 API(/v1/chat/completions、/v1/models), 两个引擎通用;
+请求层走 OpenAI 兼容 API(/v1/chat/completions、/v1/models), 三个引擎通用;
 并发层额外采样 /metrics 的 Prometheus 指标, 指标名按引擎自动识别:
     sglang    num_running_reqs      / num_queue_reqs
     llama.cpp requests_processing   / requests_deferred    (需 --metrics 启动)
+    vLLM      num_requests_running  / num_requests_waiting
 采样不到时只跳过并发统计, 不影响吞吐/延迟结果。
 
 用法:
     ./bench.py                              # 默认 32 并发 / 256 tokens / 自动识别引擎
     ./bench.py -n 64 --max-tokens 512
     ./bench.py -n 16 --port 30000 --model qwen3.8-27b
-    ./bench.py --engine llama -n 8          # 显式指定引擎
+    ./bench.py --engine vllm -n 8          # 显式指定引擎
 
-对比引擎参数(如 sglang 的 --mamba-full-memory-ratio、llama 的 -np/--parallel)时,
-保持 -n / --max-tokens 不变, 重点看: 聚合吞吐、最大延迟、queue 峰值。
-鉴权密钥从 SGLANG_API_KEY / LLAMA_API_KEY / API_KEY 读取(经 .envrc 由 direnv 加载)。
+对比引擎参数时保持 -n / --max-tokens 不变, 重点看: 聚合吞吐、最大延迟、queue 峰值。
+鉴权密钥从 VLLM_API_KEY / SGLANG_API_KEY / LLAMA_API_KEY / API_KEY 读取。
 """
 
 import argparse
@@ -79,10 +79,15 @@ def make_request(host, port, api_key, model, max_tokens, temperature, prompt, id
 ENGINE_METRICS = {
     "sglang": ("num_running_reqs", "num_queue_reqs"),
     "llama": ("requests_processing", "requests_deferred"),
+    "vllm": ("num_requests_running", "num_requests_waiting"),
 }
 
-# llama.cpp 的 /metrics 需 --metrics 启动; 采样不到时给出这个提示
-METRICS_HINT = "llama.cpp 需加 --metrics 启动才有 /metrics(见 llama/launch.sh 的 LLAMA_METRICS)"
+METRICS_HINTS = {
+    "llama": "llama.cpp 需加 --metrics 启动才有 /metrics(见 llama/launch.sh 的 LLAMA_METRICS)",
+    "sglang": "请确认 SGLang 服务已就绪并提供 /metrics",
+    "vllm": "请确认 vLLM 服务已就绪并提供 /metrics",
+    "unknown": "无法识别引擎或服务未提供已知并发指标",
+}
 
 
 def parse_metrics(text):
@@ -99,10 +104,14 @@ def parse_metrics(text):
     return out
 
 
-def detect_engine(host, port, timeout=2.0):
+def detect_engine(host, port, api_key="", timeout=2.0):
     """取一次 /metrics, 按指标名判断引擎; 取不到或都没有则返回 None"""
+    req = urllib.request.Request(
+        build_url(host, port, "/metrics"),
+        headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+    )
     try:
-        with urllib.request.urlopen(build_url(host, port, "/metrics"), timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             names = set(parse_metrics(r.read().decode(errors="ignore")))
     except (urllib.error.URLError, OSError):
         return None
@@ -115,9 +124,10 @@ def detect_engine(host, port, timeout=2.0):
 class MetricsSampler(threading.Thread):
     """周期性采样 /metrics, 记录 running / queue 峰值"""
 
-    def __init__(self, host, port, engine, interval=0.3):
+    def __init__(self, host, port, engine, api_key="", interval=0.3):
         super().__init__(daemon=True)
         self.url = build_url(host, port, "/metrics")
+        self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self.interval = interval
         # 未识别引擎时按全部已知指标名匹配, 保证换引擎也能采到
         self.running_keys = [k for k, _ in ENGINE_METRICS.values()]
@@ -137,7 +147,8 @@ class MetricsSampler(threading.Thread):
     def run(self):
         while not self._stop.is_set():
             try:
-                with urllib.request.urlopen(self.url, timeout=2) as r:
+                req = urllib.request.Request(self.url, headers=self.headers)
+                with urllib.request.urlopen(req, timeout=2) as r:
                     for name, value in parse_metrics(
                         r.read().decode(errors="ignore")
                     ).items():
@@ -157,13 +168,14 @@ class MetricsSampler(threading.Thread):
 
 def main():
     p = argparse.ArgumentParser(
-        description="本地推理服务并发压测(sglang / llama.cpp 通用, 走 OpenAI 兼容 API)"
+        description="本地推理服务并发压测(sglang / llama.cpp / vLLM 通用, 走 OpenAI 兼容 API)"
     )
     p.add_argument("-n", "--concurrency", type=int, default=32, help="并发请求数(默认 32)")
     p.add_argument("--max-tokens", type=int, default=256, help="每请求最大生成 token(默认 256)")
     p.add_argument("--model", default=None, help="模型名; 默认从 /v1/models 自动获取")
-    p.add_argument("--engine", choices=("auto", "sglang", "llama"), default="auto",
+    p.add_argument("--engine", choices=("auto", "sglang", "llama", "vllm"), default="auto",
                    help="引擎类型, 仅影响并发指标的指标名(默认 auto: 按 /metrics 自动识别)")
+    p.add_argument("--api-key", default=None, help="Bearer API key; 默认按引擎环境变量回退")
     p.add_argument("--host", default="localhost")
     p.add_argument("-p", "--port", type=int, default=30000)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -172,11 +184,19 @@ def main():
     p.add_argument("--timeout", type=float, default=300.0, help="单请求超时秒数(默认 300)")
     args = p.parse_args()
 
-    api_key = (
-        os.environ.get("SGLANG_API_KEY")
-        or os.environ.get("LLAMA_API_KEY")
-        or os.environ.get("API_KEY", "")
-    )
+    if args.api_key is not None:
+        api_key = args.api_key
+    else:
+        key_names = {
+            "vllm": ("VLLM_API_KEY", "API_KEY"),
+            "sglang": ("SGLANG_API_KEY", "API_KEY"),
+            "llama": ("LLAMA_API_KEY", "API_KEY"),
+            "auto": ("VLLM_API_KEY", "SGLANG_API_KEY", "LLAMA_API_KEY", "API_KEY"),
+        }[args.engine]
+        api_key = next(
+            (os.environ[name] for name in key_names if name in os.environ),
+            "",
+        )
     model = args.model or get_model(args.host, args.port, api_key, args.timeout)
 
     # 预热: 不计入统计, 避免首次请求触发 JIT/CUDA graph 捕获而拉低第一波成绩
@@ -186,9 +206,9 @@ def main():
 
     engine = args.engine
     if engine == "auto":
-        engine = detect_engine(args.host, args.port) or "unknown"
+        engine = detect_engine(args.host, args.port, api_key) or "unknown"
 
-    sampler = MetricsSampler(args.host, args.port, engine)
+    sampler = MetricsSampler(args.host, args.port, engine, api_key)
     sampler.start()
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
@@ -213,7 +233,7 @@ def main():
     if sampler.sampled:
         print(f"  服务端并发     running 峰值 {sampler.running_peak:.0f} / queue 峰值 {sampler.queue_peak:.0f}")
     else:
-        print(f"  服务端并发     无数据(未从 /metrics 采到并发指标); {METRICS_HINT}")
+        print(f"  服务端并发     无数据(未从 /metrics 采到并发指标); {METRICS_HINTS.get(engine, METRICS_HINTS['unknown'])}")
     if failures:
         print(f"  失败 {len(failures)}/{len(results)}: {failures[0]}", file=sys.stderr)
         return 1
