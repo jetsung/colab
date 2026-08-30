@@ -28,6 +28,31 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 
+# ------------------------- 平台探测(CPU / GPU) ------------------------------
+# 与引擎侧 .envrc / launch.sh 保持同一套判定: 显式 GPU_PROFILE=cpu > nvidia-smi 探测
+# 是否存在可用的 NVIDIA GPU
+has_nvidia_gpu() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  local gpu=""
+  gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+  [[ -n "$gpu" ]]
+}
+
+# 纯 CPU 平台返回 0
+is_cpu_platform() {
+  local profile="${GPU_PROFILE:-}"
+  if [[ -n "$profile" ]]; then
+    if [[ "$profile" == "cpu" ]]; then
+      return 0
+    fi
+    return 1
+  fi
+  if has_nvidia_gpu; then
+    return 1
+  fi
+  return 0
+}
+
 # ============================== 参数解析框架 ================================
 # 统一前置解析: 仅 vps 消费 --gpu/--session, 其余子命令遇未知参数报错
 # 用法: parse_global <子命令> "$@"  -> 通过全局变量 GP/SE 透传
@@ -153,6 +178,11 @@ usage_install() {
 选项:
   --build, -B   llama 使用源码编译方式(默认下载 GitHub 最新 prerelease 通用预编译二进制; GPU CUDA 请用此选项)
   -h, --help    显示本帮助
+
+平台:
+  按是否探测到 NVIDIA GPU 自动选择依赖: GPU 装 CUDA 版 torch, CPU 装 CPU 版 torch;
+  llama --build 在有显卡时编 CUDA 版, 无显卡时编纯 CPU 版。
+  显卡存在但仍想按 CPU 装: GPU_PROFILE=cpu colab.sh install <engine>
 EOF
 }
 
@@ -401,8 +431,17 @@ install_llama_build() {
 
   echo ">> llama.cpp 安装目录: $LLAMA_DIR"
 
+  # ---- 平台判定: 无 NVIDIA GPU 时编纯 CPU 版本(不需要 nvcc, 也不开 GGML_CUDA) ----
+  local cpu_build=0
+  if is_cpu_platform; then
+    cpu_build=1
+    echo ">> 平台: CPU (未探测到 NVIDIA GPU) -> 编译纯 CPU 版本"
+  fi
+
   # ---- 工具链检查 ----
-  for t in git cmake gcc g++ make nvcc; do
+  local -a tools=(git cmake gcc g++ make)
+  [[ "$cpu_build" -eq 1 ]] || tools+=(nvcc)
+  for t in "${tools[@]}"; do
     if ! command -v "$t" >/dev/null 2>&1; then
       echo "ERROR: 缺少必要工具: $t" >&2
       exit 1
@@ -417,8 +456,11 @@ install_llama_build() {
     local major="${cc%.*}" minor="${cc#*.}"
     echo "${major}${minor}"
   }
-  local CUDA_ARCH="${LLAMA_CUDA_ARCH:-$(detect_arch)}"
-  echo ">> CUDA 架构: $CUDA_ARCH"
+  local CUDA_ARCH=""
+  if [[ "$cpu_build" -eq 0 ]]; then
+    CUDA_ARCH="${LLAMA_CUDA_ARCH:-$(detect_arch)}"
+    echo ">> CUDA 架构: $CUDA_ARCH"
+  fi
 
   # ---- 安装 Python 下载依赖（huggingface_hub + hf_xet）----
   # 涉及 Python 依赖统一用 uv 管理(替代 pip): 先确保 uv 可用, 再 uv pip install --system
@@ -451,11 +493,16 @@ install_llama_build() {
     rm -rf build
   fi
 
-  echo ">> CMake 配置 (CUDA, arch=$CUDA_ARCH) ..."
-  cmake -S . -B build \
-    -DGGML_CUDA=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-    -DCMAKE_BUILD_TYPE=Release
+  if [[ "$cpu_build" -eq 1 ]]; then
+    echo ">> CMake 配置 (CPU) ..."
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+  else
+    echo ">> CMake 配置 (CUDA, arch=$CUDA_ARCH) ..."
+    cmake -S . -B build \
+      -DGGML_CUDA=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+      -DCMAKE_BUILD_TYPE=Release
+  fi
 
   echo ">> 编译 ($(nproc) 线程) ..."
   cmake --build build -j"$(nproc)"
@@ -470,7 +517,7 @@ install_llama_build() {
 
 # -------- install llama: 最新 prerelease 官方预编译二进制(ubuntu-x64) --------
 # 从 GitHub 最新 prerelease 下载官方 Ubuntu 通用二进制, 解压到 $LLAMA_DIR/build/bin/
-# (预编译包不含 CUDA; GPU 用户请用 --build 编译 CUDA 版本)
+# (预编译包不含 CUDA, 是纯 CPU 构建: CPU 会话直接可用, 无需改动; GPU 用户请用 --build 编 CUDA 版)
 install_llama_prebuilt() {
   local LLAMA_DIR="${LLAMA_DIR:-/content/llama.cpp}"
   local BIN_DIR="${LLAMA_DIR}/build/bin"
@@ -573,9 +620,26 @@ install_sglang() {
   # 默认值需与 sglang/launch.sh 保持一致, 可用 SGLANG_VENV_DIR 覆盖
   local VENV_DIR="${SGLANG_VENV_DIR:-/tmp/sglang/venv}"
 
+  # CPU 平台: 装 CPU 版 torch(GPU 版的 CUDA wheel 在纯 CPU 机器上跑不起来),
+  # 且不导出 FlashInfer 架构 —— 没有 CUDA 可探测, 导出会让安装阶段去走 CUDA 编译路径。
   # 关键修复: FlashInfer 在 pip 安装/编译阶段就会探测 CUDA 架构,
   # 必须在安装前导出, 否则会误读 nvcc 版本导致 sm_120 检测失败
-  export FLASHINFER_CUDA_ARCH_LIST="12.0f"
+  local torch_backend="auto"
+  if is_cpu_platform; then
+    torch_backend="cpu"
+    echo ">> 平台: CPU (未探测到 NVIDIA GPU) -> 安装 CPU 版 torch"
+    cat >&2 <<'EOF'
+警告: SGLang 的 CPU 引擎不在 PyPI 的 sglang wheel 里 —— 官方要求用
+      pyproject_cpu.toml 从源码构建 sglang 与 sgl-kernel(或直接用官方
+      sglang/docker 下的 xeon.Dockerfile 镜像), 否则即使设置了
+      SGLANG_USE_CPU_ENGINE=1 也起不来 CPU 后端。
+      本命令仍会装好 venv 与 CPU 版 torch, 之后请按官方 CPU 文档补做源码构建:
+        https://docs.sglang.io/docs/platforms/cpu_server
+      想开箱即用请换 llama.cpp 或 vLLM(两者的 CPU 支持是官方预置的)。
+EOF
+  else
+    export FLASHINFER_CUDA_ARCH_LIST="12.0f"
+  fi
 
   echo "==> [1/4] 检查 uv 与 Python 3.12"
   if ! command -v uv >/dev/null 2>&1; then
@@ -595,7 +659,7 @@ install_sglang() {
 
   echo "==> [3/4] 安装 SGLang (含已知坑修复)"
   # 坑: UV_SYSTEM_PYTHON 会无视 venv -> 用 env -u 移除, 确保装进当前 venv
-  env -u UV_SYSTEM_PYTHON uv pip install --prerelease=allow sglang
+  env -u UV_SYSTEM_PYTHON uv pip install --prerelease=allow sglang --torch-backend="$torch_backend"
 
   echo ""
   echo "==> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/sglang/launch.sh start"
@@ -621,9 +685,16 @@ install_vllm() {
   # shellcheck disable=SC1091
   source "${VENV_DIR}/bin/activate"
 
+  # CPU 平台: 装 CPU 版 torch(GPU 版的 CUDA wheel 在纯 CPU 机器上跑不起来)
+  local torch_backend="auto"
+  if is_cpu_platform; then
+    torch_backend="cpu"
+    echo ">> 平台: CPU (未探测到 NVIDIA GPU) -> 安装 CPU 版 torch"
+  fi
+
   echo "==> [3/4] 安装官方最新 vLLM"
   # 清除 UV_SYSTEM_PYTHON, 确保依赖安装到当前 venv；按官方方式自动选择匹配的 PyTorch 后端，不固定 vLLM 版本。
-  env -u UV_SYSTEM_PYTHON uv pip install --upgrade vllm --torch-backend=auto
+  env -u UV_SYSTEM_PYTHON uv pip install --upgrade vllm --torch-backend="$torch_backend"
 
   echo "==> [4/4] 验证 vllm serve"
   command -v vllm >/dev/null 2>&1 || { echo "vLLM 安装后仍找不到 vllm 命令" >&2; exit 1; }

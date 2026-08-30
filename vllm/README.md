@@ -41,8 +41,9 @@ cd vllm
 | 文件 | 作用 |
 |---|---|
 | `launch.sh` | `start/stop/restart/status/test/logs/keep` 服务管理 |
-| `.envrc` | 继承根配置并自动加载 GPU profile |
+| `.envrc` | 继承根配置并自动加载 profile（`.env.g4` / `.env.t4` / `.env.cpu`） |
 | `.env.g4` / `.env.t4` | G4/L4/Blackwell 与 T4 的显存默认值 |
+| `.env.cpu` | CPU 平台默认值（`VLLM_DEVICE=cpu`、`VLLM_CPU_KVCACHE_SPACE`、受限上下文与并发） |
 | `README.md` | vLLM 渠道使用说明 |
 
 虚拟环境默认位于 `/tmp/vllm/venv`，可用 `VLLM_VENV_DIR` 覆盖；依赖安装与启动脚本必须使用同一个路径。
@@ -81,7 +82,19 @@ VLLM_MODEL_ROOT=/content/models VLLM_MODEL_DIR=/content/models/my-model ./launch
 | `VLLM_SERVED_NAME` | API 中的模型名，默认模型路径末段小写 |
 | `VLLM_HOST` / `VLLM_PORT` | 监听地址和端口，默认 `0.0.0.0` / `30000` |
 | `VLLM_API_KEY` | Bearer 密钥；未设置时回退 `API_KEY`，显式置空可关闭鉴权 |
-| `VLLM_GPU_MEMORY_UTILIZATION` | GPU 显存使用比例，G4 默认 `0.90`、T4 默认 `0.80` |
+| `VLLM_GPU_MEMORY_UTILIZATION` | GPU 显存使用比例，G4 默认 `0.90`、T4 默认 `0.80`；**CPU 平台不传** |
+| `VLLM_DEVICE` | 设备；默认不传由 vLLM 自动探测，`.env.cpu` 设为 `cpu`，置空即交回自动探测 |
+
+### CPU 平台（无 NVIDIA GPU）
+
+未设置 `GPU_PROFILE` 且探测不到 NVIDIA GPU 时，`.envrc` / `launch.sh` 会自动加载 `.env.cpu`：
+
+- `launch.sh` 跳过 `--gpu-memory-utilization`，改为传 `--device cpu`；
+- KV 缓存走系统内存，由 `VLLM_CPU_KVCACHE_SPACE`（GiB，默认 `8`）控制；
+- 上下文与并发收窄到 `VLLM_MAX_MODEL_LEN=8192` / `VLLM_MAX_NUM_SEQS=64`；
+- **默认的 27B 模型在 CPU 会话内存里装不下**，请换小模型（如 `VLLM_MODEL_REPO=Qwen/Qwen3-8B`）。
+
+`./colab.sh install vllm` 在 CPU 平台会装 CPU 版 torch；想强制按 CPU 装：`GPU_PROFILE=cpu ./colab.sh install vllm`。
 | `VLLM_MAX_MODEL_LEN` | 最大上下文长度；留空使用 vLLM/模型默认值 |
 | `VLLM_MAX_NUM_SEQS` | 最大并发序列数，默认 `512`；vLLM 默认 1024 会让混合 mamba 模型在 CUDA graph 阶段报 `max_num_seqs exceeds available Mamba cache blocks` |
 | `VLLM_MAX_NUM_BATCHED_TOKENS` | 单批最大 token 数 |

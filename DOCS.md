@@ -52,9 +52,59 @@
 - [C5 vLLM 压测与调优](#c5-vllm-压测与调优)
 
 **通用**
+- [0. 运行平台与 profile（G4 / T4 / CPU）](#0-运行平台与-profile)
 - [5. 模型存放：冷存储（Drive）vs 本地盘](#5-模型存放冷存储google-drive-vs-本地盘)
 - [6. 运维与监控](#6-运维与监控)
 - [7. 常见问题 FAQ](#7-常见问题-faq)
+
+---
+
+## 0. 运行平台与 profile
+
+三个引擎都通过 **profile 文件**适配运行平台，文件位于各引擎目录下：`.env.g4` / `.env.t4` / `.env.cpu`。
+
+加载优先级（各引擎的 `.envrc` 与 `launch.sh` 判定逻辑一致）：
+
+1. 显式 `GPU_PROFILE=g4|t4|cpu` → 加载对应的 `.env.<profile>`；
+2. 未设置 → 用 `nvidia-smi` 自动探测，按显卡型号匹配 `.env.g4` / `.env.t4`；
+3. **没有 `nvidia-smi` 或无输出 → 加载 `.env.cpu`**；
+4. 探测到显卡但型号未识别 → 不加载任何 profile（避免把 A100 之类误判成 CPU 而静默降速）。
+
+```bash
+GPU_PROFILE=cpu ./colab.sh install vllm     # 有显卡也强制按 CPU 装
+```
+
+### CPU 会话（无 NVIDIA GPU）
+
+**安装**：`./colab.sh install <engine>` 已按平台自动选依赖 —— GPU 装 CUDA 版 torch，
+**CPU 装 CPU 版 torch**（`--torch-backend=cpu`）；`install llama --build` 在有显卡时编 CUDA 版
+（`-DGGML_CUDA=ON`）、无显卡时编纯 CPU 版且不再要求 `nvcc`。默认的官方预编译 `ubuntu-x64`
+包本身就是纯 CPU 构建，两种会话都能直接用。
+
+**启动**：各 `launch.sh` 在 CPU 平台自动跳过 GPU 专属参数，并显式传 `--device cpu`：
+
+| 引擎 | CPU 平台跳过的参数 | CPU 平台改用 |
+|---|---|---|
+| SGLang | `--attention-backend flashinfer`、`--kv-cache-dtype fp8_e4m3`、`--mem-fraction-static`；不导出 `FLASHINFER_CUDA_ARCH_LIST` | `--device cpu` + `--disable-overlap-schedule`，并 export `SGLANG_USE_CPU_ENGINE=1` |
+| vLLM | `--gpu-memory-utilization`；不做 FlashInfer 架构探测 | `--device cpu`（`VLLM_DEVICE`）+ `VLLM_CPU_KVCACHE_SPACE` |
+| llama.cpp | 仅把 `-ngl` 降为 0（GPU 专属参数本身就没有） | `-t`（`LLAMA_THREADS`，默认不传交给 llama.cpp 自定） |
+
+> **SGLang 在 CPU 上需要额外安装步骤**：它的 CPU 引擎不在 PyPI 的 `sglang` wheel 里，
+> 官方要求用 `pyproject_cpu.toml` 从源码构建 `sglang` 与 `sgl-kernel`（或直接用官方
+> `sglang/docker` 下的 `xeon.Dockerfile` 镜像），见
+> [SGLang CPU Server](https://docs.sglang.io/docs/platforms/cpu_server)。
+> `./colab.sh install sglang` 在 CPU 平台会装好 venv + CPU 版 torch 并打印该提示，但不会
+> 替你做源码构建。想开箱即用请优先选 llama.cpp 或 vLLM。
+
+**必须自己换小模型**：默认的 27B 稠密 / 80B-A3B MoE 模型在 CPU 会话的内存（约 12GB）里装不下。
+SGLang/vLLM 建议 `Qwen/Qwen3-8B` 量级，llama.cpp 建议 `Qwen/Qwen3-8B-GGUF` + `Q4_K_M`
+（各 `.env.cpu` 里已给出注释开关，取消注释即可）。
+
+**上下文**：CPU 上 KV cache 走系统内存，`.env.cpu` 统一限制到 `8192`。不限制的话会按模型的
+训练上下文（Qwen3 可达 256K）建池，几十 GB 内存直接打满。内存充裕可按需调大。
+
+> CPU 上吞吐比 GPU 低一到两个数量级，建议只用于功能验证；SGLang 的 CPU 后端覆盖度不如
+> vLLM / llama.cpp，遇到问题优先换这两个引擎。
 
 ---
 
@@ -194,7 +244,8 @@ curl http://localhost:30000/health   # 返回 200 即正常
 | `--host / --port` | 监听地址与端口（默认 `127.0.0.1:30000`，对外需 `0.0.0.0`） |
 | `--api-key` | Bearer 鉴权密钥；不设则无鉴权 |
 | `--ctx-size` | 上下文长度（token）；越大越占显存 |
-| `-ngl, --n-gpu-layers` | 放入 GPU 的层数；`999` = 全部放 GPU（显存够时最快） |
+| `-ngl, --n-gpu-layers` | 放入 GPU 的层数；`999` = 全部放 GPU（显存够时最快）；**CPU 会话由 `.env.cpu` 设为 `0`** |
+| `-t, --threads` | CPU 推理线程数；由 `LLAMA_THREADS` 控制，默认不传（交给 llama.cpp 按核心数自定） |
 | `-b, --batch-size` | 推理批次大小，默认 2048 |
 | `-ub, --ubatch-size` | 微批次大小（影响显存与速度），默认 512 |
 | `--threads / --threads-batch` | CPU 线程数（KV 缓存、非 GPU 部分用） |
@@ -206,6 +257,9 @@ curl http://localhost:30000/health   # 返回 200 即正常
 > **G4/T4 低显存调优**：
 > - 显存紧张 → 用更低量化（Q4）、减小 `--ctx-size`、降 `-ngl` 让部分层跑 CPU；
 > - 速度优先且显存够 → `-ngl 999` 全 GPU、`--parallel 1~4`、合理 `-ub`。
+>
+> **CPU 会话调优**（见[第 0 节](#0-运行平台与-profile)）：`-ngl 0` + 小模型 +
+> `--ctx-size` 限制到 8192；线程数可用 `LLAMA_THREADS` 显式指定（超线程机器上设物理核心数通常更快）。
 
 ---
 
@@ -366,7 +420,8 @@ make sglang-bench BENCH_ARGS="-n 32 --max-tokens 256"
 脚本为**通用模型**设计：served 模型名、推理/工具调用解析器、chat template、
 上下文长度、mamba 参数、EAGLE 投机解码等均由模型 `config.json` 自动推导，
 也可用同名 `SGLANG_*` 环境变量覆盖（见 B4）。进入 `sglang/` 时 `.envrc` 自动加载
-GPU profile（`.env.g4`/`.env.t4`），日志统一写在根目录 `logs/sglang_server.log`。
+profile（`.env.g4`/`.env.t4`/`.env.cpu`，见[第 0 节](#0-运行平台与-profile)），
+日志统一写在根目录 `logs/sglang_server.log`。
 
 ### API 密钥（鉴权）
 
@@ -393,11 +448,11 @@ SGLANG_API_KEY='sk-你的密钥' ./launch.sh start
 |---|---|---|
 | `--model-path` | `Qwen/Qwen3.8-27B`（默认） | 由 `SGLANG_MODEL_REPO` 控制（未设置回退 `MODEL_REPO`）；HF ID 自动下载或本地路径 |
 | `--served-model-name` | 模型路径末段（默认） | API 里的模型别名，**自动推导**；可用 `SGLANG_SERVED_NAME` 覆盖 |
-| `--attention-backend` | `flashinfer` | 默认注意力后端 |
-| `--kv-cache-dtype` | `fp8_e4m3` | KV 量化为 8bit，KV 容量翻倍（省显存，适合 G4/T4） |
+| `--attention-backend` | `flashinfer` | 默认注意力后端（**CPU 平台跳过**，见[第 0 节](#0-运行平台与-profile)） |
+| `--kv-cache-dtype` | `fp8_e4m3` | KV 量化为 8bit，KV 容量翻倍（省显存，适合 G4/T4；**CPU 平台跳过**） |
 | `--chunked-prefill-size` | `2048` | prefill 分块，降低长输入首 token 延迟抖动 |
 | `--context-length` | 模型 `max_position_embeddings`（默认） | **自动推导**；可用 `SGLANG_CTX` 覆盖（默认 0=自动）；KV 池按剩余显存分配，不预占 |
-| `--mem-fraction-static` | `0.90` | 静态显存占比。**G4/T4 OOM 时降到 0.85 试探**（由 `SGLANG_MEM_FRACTION_STATIC` 控制；`.env.g4`/`.env.t4` 提供 0.85/0.80） |
+| `--mem-fraction-static` | `0.90` | 静态显存占比。**G4/T4 OOM 时降到 0.85 试探**（由 `SGLANG_MEM_FRACTION_STATIC` 控制；`.env.g4`/`.env.t4` 提供 0.85/0.80；**CPU 平台不传**） |
 | `--reasoning-parser` | 按家族推导 | **自动推导**（qwen→`qwen3`、deepseek→`deepseek_v3`、glm→`glm45`）；可用 `SGLANG_REASONING_PARSER` 覆盖 |
 | `--tool-call-parser` | 按家族推导 | **自动推导**（qwen→`qwen3_coder` 等）；可用 `SGLANG_TOOL_CALL_PARSER` 覆盖 |
 | `--default-chat-template-kwargs` | 按家族推导 | **自动推导**（qwen→`{"enable_thinking": true}`）；可用 `SGLANG_CHAT_TEMPLATE_KWARGS` 覆盖 |
@@ -547,7 +602,8 @@ export VLLM_API_KEY=sk-your-key
 | `--served-model-name` | `VLLM_SERVED_NAME` | API 中的模型名，默认取路径末段小写 |
 | `--host` / `--port` | `VLLM_HOST` / `VLLM_PORT` | 默认 `0.0.0.0:30000` |
 | `--api-key` | `VLLM_API_KEY` / `API_KEY` | Bearer 鉴权；空值不传参数 |
-| `--gpu-memory-utilization` | `VLLM_GPU_MEMORY_UTILIZATION` | GPU 显存使用比例；G4 默认 0.90、T4 默认 0.80 |
+| `--gpu-memory-utilization` | `VLLM_GPU_MEMORY_UTILIZATION` | GPU 显存使用比例；G4 默认 0.90、T4 默认 0.80（**CPU 平台不传**，改由 `VLLM_CPU_KVCACHE_SPACE` 控制 KV 缓存） |
+| `--device` | `VLLM_DEVICE` | 默认不传，由 vLLM 自动探测；`.env.cpu` 显式设为 `cpu`（置空即交回自动探测） |
 | `--max-model-len` | `VLLM_MAX_MODEL_LEN` | 最大上下文长度；留空使用模型/vLLM 默认值 |
 | `--max-num-seqs` | `VLLM_MAX_NUM_SEQS` | 限制并发序列数，默认 `512`；显存不足时可继续降低 |
 | `--max-num-batched-tokens` | `VLLM_MAX_NUM_BATCHED_TOKENS` | 限制单批 token，控制显存与延迟 |

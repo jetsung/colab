@@ -19,7 +19,10 @@
 #   LLAMA_MODEL_REPO  模型仓库(不可为空; 未设置时回退 MODEL_REPO)
 #   LLAMA_MODEL_NAME  模型名(未设置时从 REPO 提取: / 后部分去 -GGUF); 服务 --alias 为其小写形式
 #                     未显式设置时, 别名改用"仓库文件清单推导出的真实前缀"(见下方自适应说明)
-#   LLAMA_QUANT       量化档(不可为空, 无默认; 由 .envrc / gpu profile 提供)
+#   LLAMA_QUANT       量化档(不可为空, 无默认; 由 .envrc / profile 提供)
+#   LLAMA_NGL         GPU 卸载层数(默认 999=全部; .env.cpu 为 0=纯 CPU 推理)
+#   LLAMA_CTX         上下文长度(默认 0=由 llama.cpp 按空闲显存拟合; .env.cpu 为 8192)
+#   LLAMA_THREADS     CPU 推理线程数(默认 0=由 llama.cpp 按核心数自行决定, 即不传 -t)
 #   LLAMA_MODEL_ROOT  模型基础盘前缀(未设置回退 MODEL_ROOT, 再兜底 /content/models; 换持久化盘只改这一层)
 #                     不支持 Google Drive(/content/drive): 指向 Drive 的路径会在启动时报错
 #   LLAMA_MODEL_DIR   本仓库模型目录(默认 <ROOT>/<repo名>, 按仓库隔离; 显式设置时原样使用)
@@ -52,26 +55,54 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 
-# GPU profile 兜底加载(不依赖 direnv):
+# ------------------------- 平台探测(CPU / GPU) ------------------------------
+# 是否存在可用的 NVIDIA GPU
+has_nvidia_gpu() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  local gpu=""
+  gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+  [[ -n "$gpu" ]]
+}
+
+# 纯 CPU 平台: 显式 GPU_PROFILE=cpu, 或未设置 GPU_PROFILE 且探测不到 NVIDIA GPU
+is_cpu_platform() {
+  local profile="${GPU_PROFILE:-}"
+  if [[ -n "$profile" ]]; then
+    if [[ "$profile" == "cpu" ]]; then
+      return 0
+    fi
+    return 1
+  fi
+  if has_nvidia_gpu; then
+    return 1
+  fi
+  return 0
+}
+
+# profile 兜底加载(不依赖 direnv):
 # 环境变量一律继承调用方 shell(外层 direnv hook 注入)。若调用方未 cd 进本目录(引擎 .envrc
 # 未加载), LLAMA_QUANT / LLAMA_MODEL_REPO 等引擎专属默认值会缺失, 这里按 GPU_PROFILE
-# (未设置时按 nvidia-smi 探测)直接 source 本目录的 .env.<g4|t4>。
+# (未设置时按 nvidia-smi 探测, 无显卡则按 cpu)直接 source 本目录的 .env.<g4|t4|cpu>。
 # profile 是纯 bash(只有 export VAR="${VAR:-默认}"), 不含 direnv stdlib, 可安全 source:
 # 幂等且不覆盖已有值(direnv 已加载过再 source 一次无副作用)。
 load_gpu_profile() {
   local profile="${GPU_PROFILE:-}"
   if [[ -z "$profile" ]]; then
-    local gpu
-    gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+    local gpu=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+    fi
     case "$gpu" in
       *T4*)                  profile=t4 ;;
       *G4*|*L4*|*Blackwell*) profile=g4 ;;   # Blackwell 系(如 RTX PRO 6000)按 G4 处理
+      "")                    profile=cpu ;;  # 无 nvidia-smi 或无输出: 纯 CPU 平台
+      # 有显卡但型号未识别: 不套用任何 profile(避免把 A100 之类误判成 CPU 而静默降速)
     esac
   fi
   [[ -n "$profile" ]] || return 0
   local f="${SCRIPT_DIR}/.env.${profile}"
   [[ -r "$f" ]] || return 0
-  echo ">> [llama] 加载 GPU profile: ${profile} (${f})" >&2
+  echo ">> [llama] 加载 profile: ${profile} (${f})" >&2
   # shellcheck disable=SC1090
   source "$f"
 }
@@ -151,6 +182,8 @@ readonly PORT="${LLAMA_PORT:-30000}"
 readonly HOST="${LLAMA_HOST:-0.0.0.0}"
 readonly LLAMA_NGL="${LLAMA_NGL:-999}"
 readonly LLAMA_CTX="${LLAMA_CTX:-0}"
+# CPU 推理线程数: 0/空 = 不传 -t, 交给 llama.cpp 按核心数自行决定
+readonly LLAMA_THREADS="${LLAMA_THREADS:-0}"
 readonly LLAMA_API_KEY="${LLAMA_API_KEY:-${API_KEY:-}}"
 readonly LLAMA_XET="${LLAMA_XET:-1}"   # 1=启用 HuggingFace Xet 存储(默认), 0=禁用
 # Prometheus 指标端点 /metrics: 1=启用(默认, 供根目录 bench.py 采样并发), 0=禁用
@@ -639,6 +672,10 @@ do_start() {
     --ctx-size "$LLAMA_CTX")
   if [[ -n "$MMPROJ_FILE" ]]; then
     LAUNCH_CMD+=(--mmproj "$MMPROJ_FILE")
+  fi
+  # CPU 线程数: 仅显式指定(非 0)时传入, 否则交给 llama.cpp 自行决定
+  if [[ "$LLAMA_THREADS" != "0" ]]; then
+    LAUNCH_CMD+=(-t "$LLAMA_THREADS")
   fi
   # /metrics: 默认开启, 供根目录 bench.py 采样 requests_processing / requests_deferred
   # (llama-server 默认不开放该端点); LLAMA_METRICS=0 可关闭

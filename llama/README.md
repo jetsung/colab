@@ -133,7 +133,8 @@ LLAMA_QUANT=UD-Q2_K_XL ./launch.sh start                      # 换个量化档
 | `HF_ENDPOINT` | `https://huggingface.co` | HF 端点（镜像站可覆盖；文件清单与 `hf download` 均遵循） |
 | `LLAMA_SERVER` | `/content/llama.cpp/build/bin/llama-server` | llama-server 二进制路径 |
 | `LLAMA_HOST` / `LLAMA_PORT` | `0.0.0.0` / `30000` | 监听地址与端口 |
-| `LLAMA_CTX` / `LLAMA_NGL` | `0` / `999` | 上下文长度（0=自动按空闲显存拟合）/ GPU 层数 |
+| `LLAMA_CTX` / `LLAMA_NGL` | `0` / `999` | 上下文长度（0=自动按空闲显存拟合）/ GPU 层数（CPU 平台为 `8192` / `0`） |
+| `LLAMA_THREADS` | `0` | CPU 推理线程数；0=不传 `-t`，交给 llama.cpp 按核心数自定 |
 | `LLAMA_API_KEY` | 回退 `API_KEY` | 服务器 API 鉴权密钥 |
 | `LLAMA_XET` | `1` | 1=启用 HF Xet 存储（默认），0=禁用 |
 | `LLAMA_METRICS` | `1` | 1=开放 `/metrics` 端点（默认，供根目录 `bench.py` 采样并发），0=禁用 |
@@ -146,8 +147,10 @@ LLAMA_QUANT=UD-Q2_K_XL ./launch.sh start                      # 换个量化档
 > 不会把不相干的 mmproj 传给文本模型。检测依赖 `llama-gguf`（与 `llama` 同目录），缺失时按支持处理。
 > `LLAMA_VISION=1` 会跳过模型能力检测，直接尝试查找或下载 mmproj；`LLAMA_VISION=0` 则不检查、不加载也不下载 mmproj。
 
-> GPU 适配：进入 `llama/` 目录时，`.envrc` 按 `GPU_PROFILE`（或 `nvidia-smi` 自动探测）
-> 加载 `.env.g4` / `.env.t4`（如 G4 → `LLAMA_QUANT=UD-Q2_K_XL`、T4 → `UD-IQ1_M` 等）。
+> 平台适配：进入 `llama/` 目录时，`.envrc` 按 `GPU_PROFILE` 加载 profile；未设置时用
+> `nvidia-smi` 自动探测（如 G4 → `LLAMA_QUANT=UD-Q2_K_XL`、T4 → `UD-IQ1_M`），
+> **没有显卡则加载 `.env.cpu`**（`-ngl 0`、`LLAMA_CTX=8192`、`LLAMA_QUANT=Q4_K_M`）。
+> 也可显式指定 `GPU_PROFILE=g4|t4|cpu`。
 
 启动成功后日志应有：
 ```
@@ -224,8 +227,9 @@ colab/
 ├── colab.sh            # 一体化入口: ./colab.sh install llama 安装引擎（默认 prerelease 预编译）
 ├── logs/llama_server.log   # 服务日志（根目录 logs/）
 ├── llama/
-│   ├── .envrc          # direnv: 继承根 .envrc + 按 GPU 加载 .env.g4/.env.t4
+│   ├── .envrc          # direnv: 继承根 .envrc + 按平台加载 .env.g4/.env.t4/.env.cpu
 │   ├── .env.g4/.env.t4 # GPU profile（LLAMA_* 变量: 量化/上下文/架构）
+│   ├── .env.cpu        # CPU profile（无 NVIDIA GPU 时自动加载: -ngl 0/上下文/线程）
 │   ├── launch.sh       # 服务管理: start/stop/restart/status/logs/keep
 │   └── llama.pid       # 运行 PID（自动生成）
 └── /content/

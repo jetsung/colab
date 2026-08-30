@@ -17,8 +17,9 @@
 | `colab.sh setup` | 根目录 | Colab terminal | 前置依赖安装：direnv、bore、relaydrop、opencode |
 | `colab.sh install sglang` | 根目录 | Colab terminal | 装环境：装 uv → 建 Python 3.12 venv（默认 `/tmp/sglang/venv`，**项目外**）→ 装 SGLang（含已知坑修复）；**不自动启动服务**，启动请另跑 `./launch.sh start` |
 | `launch.sh` | `sglang/` | Colab terminal | 服务管理：`start` / `stop` / `restart` / `status` / `logs` / `keep`（守护） |
-| `.envrc` | `sglang/` | Colab terminal | direnv：继承根 `.envrc`，按 `GPU_PROFILE`（或自动探测）加载 `.env.g4`/`.env.t4`，并声明 `SGLANG_*` 空默认（留空即自动推导） |
+| `.envrc` | `sglang/` | Colab terminal | direnv：继承根 `.envrc`，按 `GPU_PROFILE`（或自动探测）加载 `.env.g4`/`.env.t4`/`.env.cpu`，并声明 `SGLANG_*` 空默认（留空即自动推导） |
 | `.env.g4` / `.env.t4` | `sglang/` | Colab terminal | GPU profile（`SGLANG_MEM_FRACTION_STATIC` / `SGLANG_CTX` 等；架构由 launch.sh 自动探测） |
+| `.env.cpu` | `sglang/` | Colab terminal | CPU profile（无 NVIDIA GPU 时自动加载：`SGLANG_DEVICE=cpu`、关闭投机解码、上下文限 8192） |
 | `colab.sh bore` | 根目录 | Colab terminal | bore 公网隧道：`30000 → ${BORE_PORT:-65535}`，setsid 后台托管，日志 `logs/bore.log` |
 | `sglang.ipynb` | `sglang/` | Colab | 部署流程 Notebook 版：等价于在 terminal 依次执行 `colab.sh setup all` / `colab.sh install sglang` / `colab.sh sglang start` / `colab.sh bore start`，另含 .env 加载、就绪等待与 API 验证单元格；上传后 Run All 即可，项目路径可自定义（第 0 节填写）或按 环境变量→工作目录→子目录→Drive 自动探测 |
 | `.envrc`（根） | 根目录 | Colab terminal | direnv 入口：`PATH_add`、`API_KEY` / `MODEL_REPO` / `BORE_PORT` 默认值、`dotenv` 加载 `.env`（`.env` 不入 git） |
@@ -118,7 +119,19 @@ print(resp.choices[0].message.content)            # 最终回答
 
 **根 `.envrc`** 保留 `PATH_add`、`API_KEY` / `MODEL_REPO` / `BORE_PORT` 默认值与 `dotenv`，其余变量值从同目录 `.env` 加载（`.env` 含密钥，已被 `.gitignore` 忽略，**勿提交**）。修改 `.envrc` 后需重新执行 `direnv allow .`。
 
-**`sglang/.envrc`** 继承根配置后，按 `GPU_PROFILE`（未设置时用 `nvidia-smi` 自动探测 G4/T4）加载 `.env.g4` / `.env.t4`，并声明以下 `SGLANG_*` 空默认（留空即由脚本按模型 `config.json` 自动推导）。
+**`sglang/.envrc`** 继承根配置后，按 `GPU_PROFILE` 加载 profile：未设置时用 `nvidia-smi` 自动探测（G4/T4），**无显卡则加载 `.env.cpu`**，并声明以下 `SGLANG_*` 空默认（留空即由脚本按模型 `config.json` 自动推导）。
+
+> **CPU 会话**：`launch.sh` 会自动跳过 `--attention-backend flashinfer` / `--kv-cache-dtype fp8_e4m3` /
+> `--mem-fraction-static`（均为 GPU 专属），改为传 `--device cpu --disable-overlap-schedule`，
+> 并 export `SGLANG_USE_CPU_ENGINE=1`（官方要求，否则不起 CPU 后端）、关闭投机解码。
+>
+> ⚠️ **SGLang 的 CPU 引擎不在 PyPI 的 `sglang` wheel 里**：`./colab.sh install sglang` 在 CPU 平台
+> 只装 venv + CPU 版 torch，还需按官方
+> [CPU Server 文档](https://docs.sglang.io/docs/platforms/cpu_server) 用 `pyproject_cpu.toml` 源码构建
+> `sglang` 与 `sgl-kernel`（或直接用官方 `xeon.Dockerfile` 镜像）。
+> 想开箱即用请优先选 llama.cpp 或 vLLM。
+>
+> 另外默认的 `Qwen/Qwen3.8-27B` 在 CPU 会话内存里装不下，**请显式换小模型**（如 `SGLANG_MODEL_REPO=Qwen/Qwen3-8B`）。
 
 | 变量 | 说明 |
 |---|---|

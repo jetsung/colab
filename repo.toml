@@ -1,0 +1,8 @@
+# 3t/s
+[[llama]]
+MODE=CPU
+TYPE=S
+LLAMA_MODEL_REPO=tencent/Hy-MT2-1.8B-GGUF
+LLAMA_QUANT=Q8_0
+
+

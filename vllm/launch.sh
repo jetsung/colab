@@ -19,7 +19,9 @@
 #   VLLM_SERVED_NAME     API model name (default lower-case repo-name)
 #   VLLM_HOST / VLLM_PORT  Listen address and port (0.0.0.0 / 30000)
 #   VLLM_API_KEY         API key; falls back to API_KEY; explicit empty disables auth
-#   VLLM_GPU_MEMORY_UTILIZATION  GPU memory fraction (default 0.90)
+#   VLLM_GPU_MEMORY_UTILIZATION  GPU memory fraction (default 0.90; dropped on CPU)
+#   VLLM_DEVICE            Device override; .env.cpu sets "cpu", empty lets vLLM probe
+#   VLLM_CPU_KVCACHE_SPACE CPU KV cache size in GiB (read by vLLM from the environment)
 #   VLLM_MAX_MODEL_LEN   Optional maximum context length
 #   VLLM_MAX_NUM_SEQS    Optional maximum concurrent sequences
 #   VLLM_MAX_NUM_BATCHED_TOKENS  Optional batch token limit
@@ -58,20 +60,51 @@ readonly CMD_LOG="${LOG_DIR}/launch_cmd.log"
 readonly PID_FILE="${WORKDIR}/vllm.pid"
 readonly KEEP_LOG="${LOG_DIR}/keeper.log"
 
+# ------------------------- 平台探测(CPU / GPU) ------------------------------
+# 是否存在可用的 NVIDIA GPU
+has_nvidia_gpu() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  local gpu=""
+  gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+  [[ -n "$gpu" ]]
+}
+
+# 纯 CPU 平台: 显式 GPU_PROFILE=cpu, 或未设置 GPU_PROFILE 且探测不到 NVIDIA GPU
+is_cpu_platform() {
+  local profile="${GPU_PROFILE:-}"
+  if [[ -n "$profile" ]]; then
+    if [[ "$profile" == "cpu" ]]; then
+      return 0
+    fi
+    return 1
+  fi
+  if has_nvidia_gpu; then
+    return 1
+  fi
+  return 0
+}
+
+# profile 兜底加载(不依赖 direnv): 未 cd 进本目录(引擎 .envrc 未加载)时, 按
+# GPU_PROFILE(未设置则按 nvidia-smi 探测, 无显卡则按 cpu)source 本目录
+# .env.<g4|t4|cpu>, 补上 VLLM_GPU_MEMORY_UTILIZATION 等引擎专属默认值。
 load_gpu_profile() {
   local profile="${GPU_PROFILE:-}"
   if [[ -z "$profile" ]]; then
-    local gpu
-    gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+    local gpu=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+    fi
     case "$gpu" in
       *T4*)                  profile=t4 ;;
       *G4*|*L4*|*Blackwell*) profile=g4 ;;
+      "")                    profile=cpu ;;   # 无 nvidia-smi 或无输出: 纯 CPU 平台
+      # 有显卡但型号未识别: 不套用任何 profile(避免把 A100 之类误判成 CPU 而静默降速)
     esac
   fi
   [[ -n "$profile" ]] || return 0
   local file="${SCRIPT_DIR}/.env.${profile}"
   [[ -r "$file" ]] || return 0
-  echo ">> [vllm] 加载 GPU profile: ${profile} (${file})" >&2
+  echo ">> [vllm] 加载 profile: ${profile} (${file})" >&2
   # shellcheck disable=SC1090
   source "$file"
 }
@@ -96,6 +129,11 @@ nvcc_at_least() {
 # FlashInfer rejects SM 12.x when an older system nvcc is used for probing.
 # A suffixed arch bypasses that probe while still selecting the right kernels.
 configure_flashinfer_arch() {
+  # 纯 CPU 平台: FlashInfer 是 CUDA 专用, 不参与探测
+  if is_cpu_platform; then
+    export FLASHINFER_CUDA_ARCH_LIST
+    return 0
+  fi
   if [[ -n "${FLASHINFER_CUDA_ARCH_LIST:-}" ]]; then
     export FLASHINFER_CUDA_ARCH_LIST
     return 0
@@ -402,6 +440,9 @@ readonly WRAPPER_ENV_NAMES=(
   VLLM_MODEL_REPO VLLM_MODEL_ROOT VLLM_MODEL_DIR VLLM_DOWNLOAD_DIR
   VLLM_SERVED_NAME VLLM_HOST VLLM_PORT VLLM_GPU_MEMORY_UTILIZATION
   VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS VLLM_MAX_NUM_BATCHED_TOKENS
+  # VLLM_DEVICE 以 --device 传入, 不再留给子进程(避免 vLLM 的未知 VLLM_* 告警);
+  # 但 VLLM_CPU_KVCACHE_SPACE 必须留给子进程 —— vLLM 只从环境读它
+  VLLM_DEVICE
   VLLM_TENSOR_PARALLEL_SIZE VLLM_DTYPE VLLM_QUANTIZATION VLLM_VENV_DIR
   VLLM_ENABLE_AUTO_TOOL_CHOICE VLLM_TOOL_CALL_PARSER VLLM_REASONING_PARSER
   VLLM_TRUST_REMOTE_CODE
@@ -444,10 +485,18 @@ do_start() {
     --served-model-name "$SERVED_NAME"
     --host "$HOST"
     --port "$PORT"
-    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
     --download-dir "$VLLM_DOWNLOAD_DIR"
     --dtype "$DTYPE"
   )
+  # CPU 平台: 没有显存可预算, --gpu-memory-utilization 无意义(KV 缓存走系统内存,
+  # 由 VLLM_CPU_KVCACHE_SPACE 控制); 改为显式指定 --device 避免 vLLM 去探测 CUDA
+  if is_cpu_platform; then
+    if [[ -n "${VLLM_DEVICE:-}" ]]; then
+      args+=(--device "$VLLM_DEVICE")
+    fi
+  else
+    args+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+  fi
   [[ -n "$MAX_MODEL_LEN" ]] && args+=(--max-model-len "$MAX_MODEL_LEN")
   [[ -n "$MAX_NUM_SEQS" ]] && args+=(--max-num-seqs "$MAX_NUM_SEQS")
   [[ -n "$MAX_NUM_BATCHED_TOKENS" ]] && args+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")

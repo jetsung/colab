@@ -24,6 +24,7 @@
 #                        HF ID 启动时权重会下载到该目录(持久化), 命中本地目录则离线直接启动
 #   SGLANG_SERVED_NAME   API 模型别名(默认取模型路径末段小写)
 #   SGLANG_HOST / SGLANG_PORT   监听地址与端口(默认 0.0.0.0 / 30000)
+#   SGLANG_DEVICE       设备(默认空=由 sglang 自动探测; .env.cpu 显式设为 cpu; 置空=交回自动探测)
 #   SGLANG_CTX    最大上下文(默认0=由 config.json 推导)
 #   SGLANG_SPECULATIVE_ALGORITHM    投机解码算法(默认按 MTP 层自动判断; 置空=关闭)
 #   SGLANG_SPECULATIVE_NUM_STEPS / SGLANG_SPECULATIVE_EAGLE_TOPK / SGLANG_SPECULATIVE_NUM_DRAFT_TOKENS
@@ -67,24 +68,53 @@ readonly CMD_LOG="${LOG_DIR}/launch_cmd.log"    # 启动命令日志(追加, 带
 readonly PID_FILE="${WORKDIR}/sglang.pid"
 readonly KEEP_LOG="${LOG_DIR}/keeper.log"
 
-# GPU profile 兜底加载(不依赖 direnv), 与 llama/launch.sh 同逻辑:
+# ------------------------- 平台探测(CPU / GPU) ------------------------------
+# 是否存在可用的 NVIDIA GPU
+has_nvidia_gpu() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  local gpu=""
+  gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+  [[ -n "$gpu" ]]
+}
+
+# 纯 CPU 平台: 显式 GPU_PROFILE=cpu, 或未设置 GPU_PROFILE 且探测不到 NVIDIA GPU
+is_cpu_platform() {
+  local profile="${GPU_PROFILE:-}"
+  if [[ -n "$profile" ]]; then
+    if [[ "$profile" == "cpu" ]]; then
+      return 0
+    fi
+    return 1
+  fi
+  if has_nvidia_gpu; then
+    return 1
+  fi
+  return 0
+}
+
+# profile 兜底加载(不依赖 direnv), 与 llama/launch.sh 同逻辑:
 # 环境变量继承调用方 shell; 未 cd 进本目录(引擎 .envrc 未加载)时, 按 GPU_PROFILE
-# (未设置则按 nvidia-smi 探测)source 本目录 .env.<g4|t4>, 补上 SGLANG_MEM_FRACTION_STATIC 等
-# 引擎专属默认值。profile 为纯 bash(${VAR:-默认}), 幂等且不覆盖已有值。
+# (未设置则按 nvidia-smi 探测, 无显卡则按 cpu)source 本目录 .env.<g4|t4|cpu>,
+# 补上 SGLANG_MEM_FRACTION_STATIC 等引擎专属默认值。
+# profile 为纯 bash(${VAR:-默认}), 幂等且不覆盖已有值。
 load_gpu_profile() {
   local profile="${GPU_PROFILE:-}"
   if [[ -z "$profile" ]]; then
-    local gpu
-    gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+    local gpu=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+    fi
     case "$gpu" in
       *T4*)                  profile=t4 ;;
       *G4*|*L4*|*Blackwell*) profile=g4 ;;   # Blackwell 系(如 RTX PRO 6000)按 G4 处理
+      "")                    profile=cpu ;;  # 无 nvidia-smi 或无输出: 纯 CPU 平台
+      # 有显卡但型号未识别: 不套用任何 profile(避免把 A100 之类误判成 CPU 而静默降速)
     esac
   fi
   [[ -n "$profile" ]] || return 0
   local f="${SCRIPT_DIR}/.env.${profile}"
   [[ -r "$f" ]] || return 0
-  echo ">> [sglang] 加载 GPU profile: ${profile} (${f})" >&2
+  echo ">> [sglang] 加载 profile: ${profile} (${f})" >&2
   # shellcheck disable=SC1090
   source "$f"
 }
@@ -146,6 +176,7 @@ readonly SPECULATIVE_NUM_DRAFT_TOKENS="${SGLANG_SPECULATIVE_NUM_DRAFT_TOKENS:-4}
 # 此处默认显式传入 48 使行为确定且消除启动提示; 可用 SGLANG_MAX_RUNNING_REQUESTS 覆盖
 readonly MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-48}"
 # 静态显存占比(KV池等): 优先 SGLANG_MEM_FRACTION_STATIC, 可由 .env.g4/.env.t4 提供
+# (CPU 平台不使用该参数, 见 do_start)
 readonly MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.90}"
 # prefill CUDA graph 后端 / 最大 batch: 非空才注入, 由 .env.t4 等 profile 提供。
 # 背景: Turing(sm75) 上 flashinfer 的 ragged prefill wrapper 在捕获图时报
@@ -194,22 +225,25 @@ nvcc_at_least() {  # $1=最低版本; 返回 0 表示满足
 
 # 推导架构列表: 后缀规则与 flashinfer/compilation_context.py 一致
 # SM 12.0 -> 12.0f/12.0a; 其它 SM 12.x -> 12.xa; SM 9/10/11 -> xa; SM <= 8 -> 无后缀
-if [[ -z "${FLASHINFER_CUDA_ARCH_LIST:-}" ]]; then
-  CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)
-  case "$CC" in
-    12.0)                                                   # Blackwell (RTX PRO 6000 / RTX 50)
-      if nvcc_at_least 12.9; then
-        FLASHINFER_CUDA_ARCH_LIST="12.0f"
-      else
-        FLASHINFER_CUDA_ARCH_LIST="12.0a"
-      fi
-      ;;
-    12.*)           FLASHINFER_CUDA_ARCH_LIST="${CC}a" ;;    # 其它 SM 12.x
-    9*|10*|11*)     FLASHINFER_CUDA_ARCH_LIST="${CC}a" ;;    # Hopper 及以后
-    *.*)            FLASHINFER_CUDA_ARCH_LIST="${CC}" ;;     # Ada(8.9) / Turing(7.5) 等无后缀
-    *)              FLASHINFER_CUDA_ARCH_LIST="" ;;          # 探测失败: 交给 FlashInfer 自行探测
-  esac
-  unset CC
+# 纯 CPU 平台不参与: FlashInfer 是 CUDA 专用, 且下方 --attention-backend 已跳过它
+if ! is_cpu_platform; then
+  if [[ -z "${FLASHINFER_CUDA_ARCH_LIST:-}" ]]; then
+    CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)
+    case "$CC" in
+      12.0)                                                   # Blackwell (RTX PRO 6000 / RTX 50)
+        if nvcc_at_least 12.9; then
+          FLASHINFER_CUDA_ARCH_LIST="12.0f"
+        else
+          FLASHINFER_CUDA_ARCH_LIST="12.0a"
+        fi
+        ;;
+      12.*)           FLASHINFER_CUDA_ARCH_LIST="${CC}a" ;;    # 其它 SM 12.x
+      9*|10*|11*)     FLASHINFER_CUDA_ARCH_LIST="${CC}a" ;;    # Hopper 及以后
+      *.*)            FLASHINFER_CUDA_ARCH_LIST="${CC}" ;;     # Ada(8.9) / Turing(7.5) 等无后缀
+      *)              FLASHINFER_CUDA_ARCH_LIST="" ;;          # 探测失败: 交给 FlashInfer 自行探测
+    esac
+    unset CC
+  fi
 fi
 export FLASHINFER_CUDA_ARCH_LIST
 
@@ -503,20 +537,38 @@ do_start() {
   local args=(
     --model-path "$MODEL_PATH"
     --served-model-name "$SERVED_NAME"
-    --attention-backend flashinfer
-    --kv-cache-dtype fp8_e4m3
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
-    --mem-fraction-static "$MEM_FRACTION_STATIC"
     --mm-feature-transport cpu
     --enable-cache-report
     --enable-metrics
     --host "$HOST" --port "$PORT"
   )
-  if [[ -n "$CUDA_GRAPH_BACKEND_PREFILL" ]]; then
-    args+=(--cuda-graph-backend-prefill "$CUDA_GRAPH_BACKEND_PREFILL")
-  fi
-  if [[ -n "$CUDA_GRAPH_MAX_BS_PREFILL" ]]; then
-    args+=(--cuda-graph-max-bs-prefill "$CUDA_GRAPH_MAX_BS_PREFILL")
+  # GPU 专属参数: CPU 平台一律跳过(flashinfer 是 CUDA 专用, fp8 KV 与静态显存占比在
+  # CPU 上无意义, 传了会直接启动失败)
+  if is_cpu_platform; then
+    # CPU 后端: 显式指定设备(置空则交回 sglang 自行探测), 并关掉 overlap schedule
+    # (官方 CPU 服务器示例命令即带 --disable-overlap-schedule)
+    if [[ -n "${SGLANG_DEVICE:-}" ]]; then
+      args+=(--device "$SGLANG_DEVICE")
+    fi
+    args+=(--disable-overlap-schedule)
+    # 官方要求: 必须设置 SGLANG_USE_CPU_ENGINE=1 才会真正启用 CPU 引擎
+    # (正常情况下已由 .env.cpu 导出, 这里兜底 export, 保证子进程一定能读到)
+    export SGLANG_USE_CPU_ENGINE="${SGLANG_USE_CPU_ENGINE:-1}"
+  else
+    args+=(
+      --attention-backend flashinfer
+      --kv-cache-dtype fp8_e4m3
+      --mem-fraction-static "$MEM_FRACTION_STATIC"
+    )
+    # prefill CUDA graph 后端/最大 batch: 非空才注入, 由 .env.t4 等 GPU profile 提供。
+    # 是 CUDA 专属(Turing 上 flashinfer ragged prefill 捕获会崩, 故置于 GPU 分支)
+    if [[ -n "$CUDA_GRAPH_BACKEND_PREFILL" ]]; then
+      args+=(--cuda-graph-backend-prefill "$CUDA_GRAPH_BACKEND_PREFILL")
+    fi
+    if [[ -n "$CUDA_GRAPH_MAX_BS_PREFILL" ]]; then
+      args+=(--cuda-graph-max-bs-prefill "$CUDA_GRAPH_MAX_BS_PREFILL")
+    fi
   fi
   if [[ "$IS_MAMBA" -eq 1 ]]; then
     args+=(
