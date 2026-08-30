@@ -31,6 +31,10 @@
 #   SGLANG_MAMBA_FULL_MEMORY_RATIO mamba 状态缓存占比(默认 0.6); mamba 模型实际并发
 #                                  ≈ max_mamba_cache_size/4, 调大提升并发、缩小 KV 池
 #   SGLANG_MEM_FRACTION_STATIC     静态显存占比(默认 0.90; 由 .env.g4/.env.t4 提供)
+#   SGLANG_CUDA_GRAPH_BACKEND_PREFILL  prefill CUDA graph 后端(默认空=由 sglang 自选;
+#                                Turing(T4, sm75) 上 flashinfer ragged prefill 捕获会崩,
+#                                见 .env.t4 中设为 disabled)
+#   SGLANG_CUDA_GRAPH_MAX_BS_PREFILL   prefill CUDA graph 最大 batch token(默认空=不限制)
 #   FLASHINFER_CUDA_ARCH_LIST   FlashInfer JIT 目标架构(默认按 nvidia-smi + nvcc 版本推导,
 #                               如 Blackwell: nvcc>=12.9 -> 12.0f, 否则 12.0a)
 #   CUDA_HOME / CUDA_PATH       JIT 编译用的 CUDA 工具链(影响架构取值; 默认用系统 nvcc)
@@ -143,6 +147,12 @@ readonly SPECULATIVE_NUM_DRAFT_TOKENS="${SGLANG_SPECULATIVE_NUM_DRAFT_TOKENS:-4}
 readonly MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-48}"
 # 静态显存占比(KV池等): 优先 SGLANG_MEM_FRACTION_STATIC, 可由 .env.g4/.env.t4 提供
 readonly MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.90}"
+# prefill CUDA graph 后端 / 最大 batch: 非空才注入, 由 .env.t4 等 profile 提供。
+# 背景: Turing(sm75) 上 flashinfer 的 ragged prefill wrapper 在捕获图时报
+#   "q.shape[0] (128) does not match qo_indptr[-1] (2048)" 导致 scheduler 退出;
+#   按 sglang 自身建议传 --cuda-graph-backend-prefill=disabled 绕过。
+readonly CUDA_GRAPH_BACKEND_PREFILL="${SGLANG_CUDA_GRAPH_BACKEND_PREFILL:-}"
+readonly CUDA_GRAPH_MAX_BS_PREFILL="${SGLANG_CUDA_GRAPH_MAX_BS_PREFILL:-}"
 # mamba 状态缓存占比(相对 KV 池): 直接决定 mamba 模型的并发上限 ——
 # max_running_requests ≈ max_mamba_cache_size / 4(投机解码下每请求 4 个 state slot)。
 # 0.2 时仅 ~29 slot(并发 7); 调大可线性提升并发, 代价是 KV 池变小(长上下文容量下降)。
@@ -502,6 +512,12 @@ do_start() {
     --enable-metrics
     --host "$HOST" --port "$PORT"
   )
+  if [[ -n "$CUDA_GRAPH_BACKEND_PREFILL" ]]; then
+    args+=(--cuda-graph-backend-prefill "$CUDA_GRAPH_BACKEND_PREFILL")
+  fi
+  if [[ -n "$CUDA_GRAPH_MAX_BS_PREFILL" ]]; then
+    args+=(--cuda-graph-max-bs-prefill "$CUDA_GRAPH_MAX_BS_PREFILL")
+  fi
   if [[ "$IS_MAMBA" -eq 1 ]]; then
     args+=(
       --mamba-radix-cache-strategy extra_buffer_lazy
