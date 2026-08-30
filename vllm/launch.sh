@@ -33,7 +33,8 @@
 #   VLLM_GENERATION_CONFIG   Sampling defaults source: empty=model generation_config.json
 #                            (default), vllm=use vLLM defaults instead
 #   VLLM_ENABLE_AUTO_TOOL_CHOICE  Enable auto tool choice (default 1)
-#   VLLM_TOOL_CALL_PARSER         Tool-call parser; auto-detected from config.json
+#   VLLM_TOOL_CALL_PARSER         Tool-call parser; auto-detected from config.json + chat template
+#   VLLM_REASONING_PARSER         Reasoning parser (returns reasoning_content); auto-detected
 #   VLLM_VENV_DIR        Python virtual environment (default /tmp/vllm/venv)
 #   FLASHINFER_CUDA_ARCH_LIST      FlashInfer JIT arch; auto-detected when unset
 #   CUDA_HOME / CUDA_PATH          CUDA toolkit used to detect nvcc version
@@ -185,7 +186,13 @@ else
   readonly VLLM_API_KEY_VALUE=""
 fi
 
-readonly PROC_PATTERN="vllm [s]erve"
+# The API server spawns a separate "VLLM::EngineCore" process that owns the GPU
+# memory. It must be matched as well: if only the API server is killed, an
+# orphaned EngineCore keeps the GPU allocated and the next start fails with
+# "Free memory on device ... is less than desired GPU memory utilization".
+readonly SERVER_PATTERN="vllm [s]erve"
+readonly ENGINE_PATTERN="VLLM::EngineCor[e]"
+readonly PROC_PATTERN="${SERVER_PATTERN}|${ENGINE_PATTERN}"
 
 pgrep_server() {
   pgrep -f "$PROC_PATTERN" >/dev/null 2>&1
@@ -260,29 +267,68 @@ resolve_model_path() {
   fi
 }
 
-# Pick the vLLM tool-call parser for the served model. Explicit VLLM_TOOL_CALL_PARSER
-# wins; otherwise use the model's config.json family. Unknown families return empty.
-detect_tool_parser() {
-  if [[ -n "${VLLM_TOOL_CALL_PARSER:-}" ]]; then
-    printf '%s' "$VLLM_TOOL_CALL_PARSER"
+# Read the model's chat template (chat_template.jinja, else tokenizer_config.json).
+model_chat_template() {
+  if [[ -f "${MODEL_PATH}/chat_template.jinja" ]]; then
+    cat "${MODEL_PATH}/chat_template.jinja"
     return 0
   fi
-  local config="${MODEL_PATH}/config.json"
-  [[ -f "$config" ]] || return 0
-  local text
-  text="$(python3 - "$config" <<'PY' 2>/dev/null || true
+  python3 - "${MODEL_PATH}/tokenizer_config.json" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     data = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
     sys.exit(0)
-parts = [str(data.get("architectures", "")), str(data.get("model_type", ""))]
-print(" ".join(parts).lower())
+tmpl = data.get("chat_template")
+print(tmpl if isinstance(tmpl, str) else "")
 PY
-)"
-  [[ -n "$text" ]] || return 0
-  case "$text" in
-    *qwen*)     printf 'qwen3_coder' ;;
+}
+
+# Read the model family from config.json (architectures + model_type).
+model_family() {
+  local config="${MODEL_PATH}/config.json"
+  [[ -f "$config" ]] || return 0
+  python3 - "$config" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+text = data.get("text_config") or {}
+print(
+    " ".join(
+        str(x)
+        for x in (
+            data.get("architectures", ""),
+            data.get("model_type", ""),
+            text.get("model_type", ""),
+        )
+    ).lower()
+)
+PY
+}
+
+# Pick the vLLM tool-call parser. Explicit VLLM_TOOL_CALL_PARSER wins; otherwise
+# use the model family plus the actual tool syntax in the chat template: the XML
+# form (<tool_call><function=...><parameter=...>) needs qwen3_xml, while the
+# JSON/special-token form needs qwen3_coder. Unknown combinations return empty.
+detect_tool_parser() {
+  if [[ -n "${VLLM_TOOL_CALL_PARSER:-}" ]]; then
+    printf '%s' "$VLLM_TOOL_CALL_PARSER"
+    return 0
+  fi
+  local family template
+  family="$(model_family)"
+  [[ -n "$family" ]] || return 0
+  template="$(model_chat_template)"
+  case "$family" in
+    *qwen*)
+      if grep -qE '<function=|<parameter=' <<<"$template"; then
+        printf 'qwen3_xml'
+      else
+        printf 'qwen3_coder'
+      fi
+      ;;
     *deepseek*) printf 'deepseek_v3' ;;
     *glm47*)    printf 'glm47' ;;
     *glm*)      printf 'glm45' ;;
@@ -294,6 +340,60 @@ PY
   esac
 }
 
+# Pick the reasoning parser so thinking is returned as reasoning_content instead
+# of being folded into content. Only used for families whose templates actually
+# emit a <think> block; explicit VLLM_REASONING_PARSER wins.
+detect_reasoning_parser() {
+  if [[ -n "${VLLM_REASONING_PARSER:-}" ]]; then
+    printf '%s' "$VLLM_REASONING_PARSER"
+    return 0
+  fi
+  local family template
+  family="$(model_family)"
+  [[ -n "$family" ]] || return 0
+  template="$(model_chat_template)"
+  grep -qiE '<think|thinking' <<<"$template" || return 0
+  case "$family" in
+    *qwen*)     printf 'qwen3' ;;
+    *deepseek*) printf 'deepseek_v3' ;;
+    *glm47*)    printf 'glm47' ;;
+    *glm*)      printf 'glm45' ;;
+    *kimi*)     printf 'kimi_k2' ;;
+    *minimax*)  printf 'minimax_m2' ;;
+    *)          printf '' ;;
+  esac
+}
+
+# The parser must exist in the installed vLLM, otherwise the server rejects the flag.
+parser_is_available() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys
+from vllm.tool_parsers import ToolParserManager
+
+sys.exit(0 if sys.argv[1] in ToolParserManager.list_registered() else 1)
+PY
+}
+
+# Only enable auto tool choice when the model's chat template actually renders
+# tool calls; the architecture name alone is not enough (a custom model can share
+# a base architecture without keeping its tool-calling template).
+model_supports_tools() {
+  local template
+  template="$(model_chat_template)"
+  [[ -n "$template" ]] || return 1
+  grep -qiE 'tool_call|tool_response|<tools>|tool_calls|function_call' <<<"$template"
+}
+
+# The reasoning parser must also exist in the installed vLLM.
+reasoning_parser_is_available() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys
+from vllm.reasoning import ReasoningParserManager
+
+sys.exit(0 if sys.argv[1] in ReasoningParserManager.list_registered() else 1)
+PY
+}
+
 # vLLM scans VLLM_* environment variables and warns about unknown ones. These
 # names are this script's own configuration; their values are passed as CLI
 # flags, so they are stripped from the server process with `env -u` (which also
@@ -303,7 +403,8 @@ readonly WRAPPER_ENV_NAMES=(
   VLLM_SERVED_NAME VLLM_HOST VLLM_PORT VLLM_GPU_MEMORY_UTILIZATION
   VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS VLLM_MAX_NUM_BATCHED_TOKENS
   VLLM_TENSOR_PARALLEL_SIZE VLLM_DTYPE VLLM_QUANTIZATION VLLM_VENV_DIR
-  VLLM_ENABLE_AUTO_TOOL_CHOICE VLLM_TOOL_CALL_PARSER VLLM_TRUST_REMOTE_CODE
+  VLLM_ENABLE_AUTO_TOOL_CHOICE VLLM_TOOL_CALL_PARSER VLLM_REASONING_PARSER
+  VLLM_TRUST_REMOTE_CODE
   VLLM_ENABLE_PREFIX_CACHING VLLM_ENFORCE_EAGER VLLM_GENERATION_CONFIG
 )
 
@@ -329,7 +430,7 @@ do_start() {
     exit 0
   fi
   if pgrep_server; then
-    echo "检测到无 PID 文件的残留进程, 请先执行: $0 stop" >&2
+    echo "检测到无 PID 文件的残留进程(含 VLLM::EngineCore), 请先执行: $0 stop" >&2
     exit 1
   fi
 
@@ -358,15 +459,38 @@ do_start() {
   [[ "${VLLM_ENFORCE_EAGER:-0}" == "1" ]] && args+=(--enforce-eager)
   [[ -n "$VLLM_API_KEY_VALUE" ]] && args+=(--api-key "$VLLM_API_KEY_VALUE")
 
+  # Speculative decoding. The value is the raw JSON vLLM expects, e.g.
+  #   {"method":"mtp","num_speculative_tokens":3}
+  # method="mtp" with no "model" key reuses the target checkpoint's own MTP
+  # weights. Deliberately NOT prefixed VLLM_: vLLM scans VLLM_* env vars and
+  # warns "Unknown vLLM environment variable detected" for anything it owns.
+  [[ -n "${SPECULATIVE_CONFIG:-}" ]] && args+=(--speculative-config "$SPECULATIVE_CONFIG")
+
   # Auto tool choice requires a parser; without both, clients sending
   # tool_choice=auto get HTTP 400. Skipped when the model family is unknown.
   if [[ "$ENABLE_AUTO_TOOL_CHOICE" == "1" ]]; then
     local tool_parser
     tool_parser="$(detect_tool_parser)"
-    if [[ -n "$tool_parser" ]]; then
-      args+=(--enable-auto-tool-choice --tool-call-parser "$tool_parser")
-    else
+    if [[ -z "$tool_parser" ]]; then
       echo "警告: 未识别模型家族的工具调用解析器, 不启用 --enable-auto-tool-choice; 可用 VLLM_TOOL_CALL_PARSER 显式指定" >&2
+    elif ! parser_is_available "$tool_parser"; then
+      echo "警告: 当前 vLLM 未注册解析器 '$tool_parser', 不启用 --enable-auto-tool-choice" >&2
+    elif ! model_supports_tools; then
+      echo "警告: 模型 chat template 未包含工具调用标记, 不启用 --enable-auto-tool-choice" >&2
+    else
+      args+=(--enable-auto-tool-choice --tool-call-parser "$tool_parser")
+    fi
+  fi
+
+  # Reasoning parser: surface the <think> block as reasoning_content instead of
+  # merging it into content. Skipped when unavailable to keep the server starting.
+  local reasoning_parser
+  reasoning_parser="$(detect_reasoning_parser)"
+  if [[ -n "$reasoning_parser" ]]; then
+    if reasoning_parser_is_available "$reasoning_parser"; then
+      args+=(--reasoning-parser "$reasoning_parser")
+    else
+      echo "警告: 当前 vLLM 未注册推理解析器 '$reasoning_parser', 跳过 --reasoning-parser" >&2
     fi
   fi
 
@@ -418,14 +542,24 @@ do_stop() {
     return 0
   fi
   echo "停止 vLLM 服务..."
-  pkill -TERM -f "$PROC_PATTERN" 2>/dev/null || true
+  # Stop the API server first so it can shut the engine down cleanly.
+  pkill -TERM -f "$SERVER_PATTERN" 2>/dev/null || true
   if wait_stopped; then
     echo "已停止"
   else
-    echo "优雅停止超时, 强制终止..."
-    pkill -KILL -f "$PROC_PATTERN" 2>/dev/null || true
-    sleep 2
-    pgrep_server && echo "仍有关联进程, 请手动检查" >&2 || echo "已停止"
+    # The engine core outlived its parent (or never got the shutdown signal);
+    # terminate it too, otherwise it keeps GPU memory reserved.
+    echo "优雅停止超时, 终止引擎进程..."
+    pkill -TERM -f "$ENGINE_PATTERN" 2>/dev/null || true
+    if wait_stopped; then
+      echo "已停止"
+    else
+      echo "优雅停止超时, 强制终止..."
+      pkill -KILL -f "$SERVER_PATTERN" 2>/dev/null || true
+      pkill -KILL -f "$ENGINE_PATTERN" 2>/dev/null || true
+      sleep 2
+      pgrep_server && echo "仍有关联进程, 请手动检查" >&2 || echo "已停止"
+    fi
   fi
   rm -f "$PID_FILE"
 }

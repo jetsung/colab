@@ -21,3 +21,18 @@ export SGLANG_CTX="${SGLANG_CTX:-0}"
 
 # 显存小时换更小模型（按需调整；不设置则用 .envrc/.env 的 SGLANG_MODEL_REPO / MODEL_REPO）
 # export SGLANG_MODEL_REPO=Qwen/Qwen3-8B
+
+# 透传 launch.sh 未覆盖的启动参数（空格分隔；设为空串可整体禁用）
+# Ornith/Qwen3.5 这类混合 Mamba 模型 + 投机解码下, mamba state cache 会把
+# 并发静默压到 max_mamba_cache_size/4(默认 64 slot -> 仅 16 并发, 即使
+# --max-running-requests 传 48)。132 slot -> 33 并发, 32 并发压测不再排队。
+# 注意: 132 是在 97GB Blackwell 上调的, mamba cache 多吃约 4GB, KV 池
+# 726k -> 289k token。真跑在小显存 Ada 机型上如 OOM, 命令行设
+# SGLANG_EXTRA_ARGS= 禁用, 或调小数值。
+# 只调 --mamba-full-memory-ratio 到不了 32 并发(slot 数随 ratio 饱和,
+# 1.0 也才 ~85), 必须直接指定 cache size。
+# `${VAR+set}`(而非 `${VAR:-}`): 显式设空串 = 禁用, 不会被默认值覆盖。
+if [[ -z "${SGLANG_EXTRA_ARGS+set}" ]]; then
+  SGLANG_EXTRA_ARGS='--max-mamba-cache-size 132'
+fi
+export SGLANG_EXTRA_ARGS

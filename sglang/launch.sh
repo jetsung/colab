@@ -540,6 +540,18 @@ do_start() {
     args+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
   fi
 
+  # 追加参数(空格分隔), 用于透传 launch.sh 未覆盖的选项, 例如:
+  #   SGLANG_EXTRA_ARGS="--max-mamba-cache-size 132" make sglang-start
+  # 混合 Mamba 模型 + 投机解码下, mamba state cache 会把并发压到
+  # max_mamba_cache_size/4; ratio 调到 1.0 也只有 ~85 slot(并发 ~21),
+  # 要更高并发只能直接指定 cache size(代价是 KV 池变小)。
+  # shellcheck disable=SC2206
+  if [[ -n "${SGLANG_EXTRA_ARGS:-}" ]]; then
+    extra=($SGLANG_EXTRA_ARGS)
+    args+=("${extra[@]}")
+    unset extra
+  fi
+
   # 启动入口: 优先官方推荐的 `sglang serve`(避免 launch_server 的 UserWarning),
   # 旧版本 venv 中无 sglang 命令时回退 python -m 方式
   local SERVER_CMD

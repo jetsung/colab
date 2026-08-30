@@ -94,7 +94,8 @@ VLLM_MODEL_ROOT=/content/models VLLM_MODEL_DIR=/content/models/my-model ./launch
 | `VLLM_ENFORCE_EAGER=1` | 追加 `--enforce-eager` |
 | `VLLM_GENERATION_CONFIG` | 采样默认来源：留空使用模型 `generation_config.json`（默认，Qwen 为 temperature 1.0 / top_k 20 / top_p 0.95）；设为 `vllm` 改用 vLLM 默认 |
 | `VLLM_ENABLE_AUTO_TOOL_CHOICE` | 自动工具调用，默认 `1`（仅影响带 tools 的请求）；设为 `0` 关闭 |
-| `VLLM_TOOL_CALL_PARSER` | 工具调用解析器；留空时按模型 `config.json` 家族推导（qwen→`qwen3_coder`、deepseek→`deepseek_v3`、glm→`glm45`、kimi→`kimi_k2`、minimax→`minimax_m2`、mistral→`mistral`、llama→`llama3_json`） |
+| `VLLM_TOOL_CALL_PARSER` | 工具调用解析器；留空时按 `config.json` 家族 + chat template 推导：qwen 家族中模板用 XML 形式（`<tool_call><function=...><parameter=...>`）→`qwen3_xml`，JSON/特殊 token 形式→`qwen3_coder`；deepseek→`deepseek_v3`、glm→`glm45`/`glm47`、kimi→`kimi_k2`、minimax→`minimax_m2`、mistral→`mistral`、llama→`llama3_json` |
+| `VLLM_REASONING_PARSER` | 推理解析器（`reasoning_content` 字段）；留空时按家族推导（qwen→`qwen3`、deepseek→`deepseek_v3`、glm→`glm45`），且要求 chat template 含 `<think>`；解析器未注册时自动跳过 |
 
 带 `tool_choice: "auto"` 的请求需要同时启用这两项，否则返回 HTTP 400。模型家族无法识别时脚本会打印警告并跳过这两个参数，此时用 `VLLM_TOOL_CALL_PARSER` 显式指定（可选值见 `vllm serve` 的 `--tool-call-parser`，如 `qwen3_coder`、`hermes`、`pythonic`）。
 | `VLLM_VENV_DIR` | venv 路径，默认 `/tmp/vllm/venv` |

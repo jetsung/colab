@@ -559,7 +559,8 @@ export VLLM_API_KEY=sk-your-key
 | `--enforce-eager` | `VLLM_ENFORCE_EAGER=1` | CUDA graph 不兼容时排查使用 |
 | `--generation-config` | `VLLM_GENERATION_CONFIG` | 留空用模型 `generation_config.json`（默认）；设为 `vllm` 用 vLLM 默认采样参数 |
 | `--enable-auto-tool-choice` | `VLLM_ENABLE_AUTO_TOOL_CHOICE` | 自动工具调用，默认开启；设为 `0` 关闭 |
-| `--tool-call-parser` | `VLLM_TOOL_CALL_PARSER` | 工具调用解析器；留空时按 `config.json` 模型家族推导 |
+| `--tool-call-parser` | `VLLM_TOOL_CALL_PARSER` | 工具调用解析器；留空时按 `config.json` 家族 + chat template 推导（Qwen XML 模板→`qwen3_xml`，JSON 模板→`qwen3_coder`） |
+| `--reasoning-parser` | `VLLM_REASONING_PARSER` | 推理解析器，把思考过程拆到 `reasoning_content`；留空时按家族推导（qwen→`qwen3`） |
 
 带 `tool_choice: "auto"` 的 coding agent 请求需要同时开启 `--enable-auto-tool-choice` 和 `--tool-call-parser`，否则 vLLM 返回 `400 --enable-auto-tool-choice and --tool-call-parser to be set`。脚本已默认开启两者；模型家族无法识别时会打印警告并跳过，此时用 `VLLM_TOOL_CALL_PARSER` 显式指定（如 `qwen3_coder`、`hermes`、`pythonic`）。
 
@@ -619,6 +620,8 @@ make vllm-bench BENCH_ARGS="-n 8 --max-tokens 128"
 **`max_num_seqs (1024) exceeds available Mamba cache blocks`**：混合 mamba 模型需要为每个并发序列预留一个 Mamba cache block，vLLM 默认 1024 超过可用数量。脚本默认传 `--max-num-seqs 512`；仍失败时降低 `VLLM_MAX_NUM_SEQS`，或提高 `VLLM_GPU_MEMORY_UTILIZATION`。
 
 **`Unknown vLLM environment variable detected: VLLM_*`**：`VLLM_GPU_MEMORY_UTILIZATION` 等只是本脚本的配置项，会被 vLLM 当作未知环境变量告警。脚本启动服务时用 `env -u` 剥离这些变量（值已通过命令行参数传入），因此新启动日志不应再出现该告警。
+
+**`Free memory on device ... is less than desired GPU memory utilization`**：上一次的 `VLLM::EngineCore` 进程未退出，仍占着显存（旧脚本 `stop` 只匹配 `vllm serve`）。现在 `PROC_PATTERN` 同时匹配 `vllm serve` 与 `VLLM::EngineCore`，`stop` 会先优雅停 API server、再终止引擎进程；`start` 检测到残留进程会要求先 `stop`。
 
 **`Default vLLM sampling parameters have been overridden by the model's generation_config.json`**：这是模型作者推荐的采样参数（Qwen 为 temperature 1.0 / top_k 20 / top_p 0.95），按默认保留即可；想改用 vLLM 默认采样时设 `VLLM_GENERATION_CONFIG=vllm`。
 
