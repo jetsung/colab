@@ -69,8 +69,12 @@ export HF_TOKEN=hf_xxxxxxxxxxxxxxxx
 
 ```bash
 cd llama
+direnv allow .        # 首次进入需允许本目录 .envrc(根目录的 allow 不覆盖引擎子目录)
 ./launch.sh start
 ```
+
+> `llama/.envrc` 是独立文件，首次 `cd llama` 时 direnv 会报 `direnv: error .../.envrc is blocked`；
+> 执行 `direnv allow .` 后 `LLAMA_*` 变量与 GPU profile 才会生效（`./colab.sh setup hint` 也会打印该步骤）。
 
 脚本会：校验必要变量 → 自适应解析模型（见下）→ 用 `llama-server` 后台加载并监听 `0.0.0.0:30000`。
 
@@ -128,7 +132,7 @@ LLAMA_QUANT=UD-Q2_K_XL ./launch.sh start                      # 换个量化档
 | `LLAMA_MODEL_REPO` | 回退 `MODEL_REPO` | HF 仓库（**不可为空**） |
 | `LLAMA_MODEL_NAME` | 从 REPO 提取（`/` 后去 `-GGUF`） | 模型名（仅作别名与匹配提示；未显式设置时别名改用清单推导结果） |
 | `LLAMA_QUANT` | 无默认（**不可为空**） | 量化档位（由 `.env.g4`/`.env.t4` 或命令行提供） |
-| `LLAMA_MODEL_ROOT` | 回退 `MODEL_ROOT`（根 `.envrc`，默认 `/content/models`，两引擎共用） | 模型基础盘前缀（换持久化盘只改这一层） |
+| `LLAMA_MODEL_ROOT` | 回退 `MODEL_ROOT`（根 `.envrc`，默认 `/content/models`，各引擎共用） | 模型基础盘前缀（换持久化盘只改这一层） |
 | `LLAMA_MODEL_DIR` | `<ROOT>/<repo名>` | 本仓库模型目录（显式设置则原样使用，不再拼 ROOT；其下按仓库真实结构存放） |
 | `HF_ENDPOINT` | `https://huggingface.co` | HF 端点（镜像站可覆盖；文件清单与 `hf download` 均遵循） |
 | `LLAMA_SERVER` | `/content/llama.cpp/build/bin/llama-server` | llama-server 二进制路径 |

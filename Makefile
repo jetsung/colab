@@ -32,9 +32,11 @@ BORE_PORT ?= 65535
         setup setup-deps setup-tools setup-bore setup-relaydrop \
         setup-opencode setup-codebuddy setup-hint \
         install-llama install-llama-build install-sglang install-vllm \
+        install-sd install-sd-build \
         llama llama-start llama-stop llama-restart llama-status llama-test llama-bench llama-logs llama-keep \
         sglang sglang-start sglang-stop sglang-restart sglang-status sglang-test sglang-bench sglang-logs sglang-keep \
         vllm vllm-start vllm-stop vllm-restart vllm-status vllm-test vllm-bench vllm-logs vllm-keep \
+        sd sd-start sd-stop sd-restart sd-status sd-test sd-generate sd-logs sd-keep \
         bore bore-start bore-stop bore-restart bore-status bore-logs \
         help list
 
@@ -146,6 +148,17 @@ install-sglang:
 install-vllm:
 	bash $(SCRIPT) install vllm
 
+# sd 安装参数，可传 --build 或 -B；默认为空(下载预编译二进制)
+SD_INSTALL_ARGS ?=
+
+## [Colab/install] install-sd: 安装 stable-diffusion.cpp(SD_INSTALL_ARGS=--build 或 -B 可源码编译)
+install-sd:
+	bash $(SCRIPT) install sd $(SD_INSTALL_ARGS)
+
+## [Colab/install] install-sd-build: 源码编译安装 stable-diffusion.cpp(等价 --build, GPU/CUDA 用此)
+install-sd-build:
+	bash $(SCRIPT) install sd --build
+
 # ================== [Colab/llama] llama.cpp 服务管理 ==================
 
 ## [Colab/llama] llama: 默认动作(启动服务)
@@ -256,6 +269,46 @@ vllm-logs:
 ## [Colab/vllm] vllm-keep: 守护模式(崩溃自动拉起)
 vllm-keep:
 	bash $(SCRIPT) vllm keep
+
+# ================== [Colab/sd] stable-diffusion.cpp 服务管理 ==================
+
+# 一次性出图提示词(省略则用环境变量 SD_PROMPT, 默认 "a lovely cat")
+PROMPT ?=
+
+## [Colab/sd] sd: 默认动作(启动服务)
+sd: sd-start
+
+## [Colab/sd] sd-start: 启动 sd-server(后台 setsid 托管; 首次自动下载模型)
+sd-start:
+	bash $(SCRIPT) sd start
+
+## [Colab/sd] sd-stop: 停止服务
+sd-stop:
+	bash $(SCRIPT) sd stop
+
+## [Colab/sd] sd-restart: 重启服务
+sd-restart:
+	bash $(SCRIPT) sd restart
+
+## [Colab/sd] sd-status: 查看状态 + 健康检查
+sd-status:
+	bash $(SCRIPT) sd status
+
+## [Colab/sd] sd-test: 调用服务生成一张测试图(需服务已就绪)
+sd-test:
+	bash $(SCRIPT) sd test
+
+## [Colab/sd] sd-generate: 用 sd-cli 一次性出图(PROMPT 指定提示词)
+sd-generate:
+	bash $(SCRIPT) sd generate $(PROMPT)
+
+## [Colab/sd] sd-logs: 跟踪日志
+sd-logs:
+	bash $(SCRIPT) sd logs
+
+## [Colab/sd] sd-keep: 守护模式(崩溃自动拉起)
+sd-keep:
+	bash $(SCRIPT) sd keep
 
 # ================== [Colab/bore] 公网隧道 ==================
 

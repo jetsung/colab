@@ -26,13 +26,17 @@ export VLLM_MODEL_REPO=Qwen/Qwen3-8B
 ./colab.sh vllm keep
 ```
 
-也可以从 `vllm/` 目录执行：
+也可以从 `vllm/` 目录执行（首次进入需先允许本目录 `.envrc`）：
 
 ```bash
 cd vllm
+direnv allow .        # 首次: 根目录的 allow 不覆盖引擎子目录
 ./launch.sh start
 ./launch.sh status
 ```
+
+> 跳过 `direnv allow .` 时 direnv 会报 `direnv: error .../.envrc is blocked`，
+> `VLLM_*` 变量与 profile 不会生效（`./colab.sh setup hint` 也会打印该步骤）。
 
 默认服务地址为 `http://0.0.0.0:30000`，与其他渠道一样；同一时间只运行一个默认端口的引擎，或通过 `VLLM_PORT` 修改端口。
 
@@ -84,17 +88,6 @@ VLLM_MODEL_ROOT=/content/models VLLM_MODEL_DIR=/content/models/my-model ./launch
 | `VLLM_API_KEY` | Bearer 密钥；未设置时回退 `API_KEY`，显式置空可关闭鉴权 |
 | `VLLM_GPU_MEMORY_UTILIZATION` | GPU 显存使用比例，G4 默认 `0.90`、T4 默认 `0.80`；**CPU 平台不传** |
 | `VLLM_DEVICE` | 设备；默认不传由 vLLM 自动探测，`.env.cpu` 设为 `cpu`，置空即交回自动探测 |
-
-### CPU 平台（无 NVIDIA GPU）
-
-未设置 `GPU_PROFILE` 且探测不到 NVIDIA GPU 时，`.envrc` / `launch.sh` 会自动加载 `.env.cpu`：
-
-- `launch.sh` 跳过 `--gpu-memory-utilization`，改为传 `--device cpu`；
-- KV 缓存走系统内存，由 `VLLM_CPU_KVCACHE_SPACE`（GiB，默认 `8`）控制；
-- 上下文与并发收窄到 `VLLM_MAX_MODEL_LEN=8192` / `VLLM_MAX_NUM_SEQS=64`；
-- **默认的 27B 模型在 CPU 会话内存里装不下**，请换小模型（如 `VLLM_MODEL_REPO=Qwen/Qwen3-8B`）。
-
-`./colab.sh install vllm` 在 CPU 平台会装 CPU 版 torch；想强制按 CPU 装：`GPU_PROFILE=cpu ./colab.sh install vllm`。
 | `VLLM_MAX_MODEL_LEN` | 最大上下文长度；留空使用 vLLM/模型默认值 |
 | `VLLM_MAX_NUM_SEQS` | 最大并发序列数，默认 `512`；vLLM 默认 1024 会让混合 mamba 模型在 CUDA graph 阶段报 `max_num_seqs exceeds available Mamba cache blocks` |
 | `VLLM_MAX_NUM_BATCHED_TOKENS` | 单批最大 token 数 |
@@ -109,9 +102,20 @@ VLLM_MODEL_ROOT=/content/models VLLM_MODEL_DIR=/content/models/my-model ./launch
 | `VLLM_ENABLE_AUTO_TOOL_CHOICE` | 自动工具调用，默认 `1`（仅影响带 tools 的请求）；设为 `0` 关闭 |
 | `VLLM_TOOL_CALL_PARSER` | 工具调用解析器；留空时按 `config.json` 家族 + chat template 推导：qwen 家族中模板用 XML 形式（`<tool_call><function=...><parameter=...>`）→`qwen3_xml`，JSON/特殊 token 形式→`qwen3_coder`；deepseek→`deepseek_v3`、glm→`glm45`/`glm47`、kimi→`kimi_k2`、minimax→`minimax_m2`、mistral→`mistral`、llama→`llama3_json` |
 | `VLLM_REASONING_PARSER` | 推理解析器（`reasoning_content` 字段）；留空时按家族推导（qwen→`qwen3`、deepseek→`deepseek_v3`、glm→`glm45`），且要求 chat template 含 `<think>`；解析器未注册时自动跳过 |
+| `VLLM_VENV_DIR` | venv 路径，默认 `/tmp/vllm/venv` |
 
 带 `tool_choice: "auto"` 的请求需要同时启用这两项，否则返回 HTTP 400。模型家族无法识别时脚本会打印警告并跳过这两个参数，此时用 `VLLM_TOOL_CALL_PARSER` 显式指定（可选值见 `vllm serve` 的 `--tool-call-parser`，如 `qwen3_coder`、`hermes`、`pythonic`）。
-| `VLLM_VENV_DIR` | venv 路径，默认 `/tmp/vllm/venv` |
+
+### CPU 平台（无 NVIDIA GPU）
+
+未设置 `GPU_PROFILE` 且探测不到 NVIDIA GPU 时，`.envrc` / `launch.sh` 会自动加载 `.env.cpu`：
+
+- `launch.sh` 跳过 `--gpu-memory-utilization`，改为传 `--device cpu`；
+- KV 缓存走系统内存，由 `VLLM_CPU_KVCACHE_SPACE`（GiB，默认 `8`）控制；
+- 上下文与并发收窄到 `VLLM_MAX_MODEL_LEN=8192` / `VLLM_MAX_NUM_SEQS=64`；
+- **默认的 27B 模型在 CPU 会话内存里装不下**，请换小模型（如 `VLLM_MODEL_REPO=Qwen/Qwen3-8B`）。
+
+`./colab.sh install vllm` 在 CPU 平台会装 CPU 版 torch；想强制按 CPU 装：`GPU_PROFILE=cpu ./colab.sh install vllm`。
 
 ## API
 

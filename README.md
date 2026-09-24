@@ -1,13 +1,13 @@
 # Google Colab 部署大模型完整教程
 
 > 目标环境：**Google Colab**（GPU 会话，可能是 **G4** 或 **T4** 显卡）/ Ubuntu Linux
-> 软件栈：三选一 —— **llama.cpp**（GGUF，轻量）、**SGLang**（高吞吐，多功能）或 **vLLM**（HF 模型，OpenAI 兼容服务）
-> 服务形态：OpenAI 兼容 API，支持深度思考、工具调用、连续批处理和 Prometheus 指标
+> 软件栈：四选一 —— **llama.cpp**（GGUF，轻量）、**SGLang**（高吞吐，多功能）、**vLLM**（HF 模型，OpenAI 兼容服务）或 **stable-diffusion.cpp**（纯 C/C++ 扩散模型出图）
+> 服务形态：OpenAI 兼容 API（文本对话 / 图片生成），支持深度思考、工具调用、连续批处理和 Prometheus 指标
 > 运行方式：宿主机用 Colab CLI 创建 GPU 会话，服务跑在 Colab terminal，经 bore 隧道暴露公网
 
 本项目用于在 **Google Colab** 环境下部署开源大模型，并对内/对外提供 OpenAI 兼容 API。
-推理引擎不限定某一种，可按需选择 **llama.cpp**、**SGLang** 或 **vLLM**（安装与使用教程见
-[DOCS.md](./DOCS.md)）：
+推理引擎不限定某一种，可按需选择 **llama.cpp**、**SGLang**、**vLLM** 或 **stable-diffusion.cpp**
+（安装与使用教程见 [DOCS.md](./DOCS.md)；`sd` 引擎见 [sd/README.md](./sd/README.md)）：
 
 - **llama.cpp**：单文件 `llama-server`，模型为 GGUF 格式，显存占用低、上手快，
   非常适合 Colab 的 **G4 / T4** 等有限显存环境。
@@ -15,16 +15,19 @@
   高并发与高吞吐，适合有更高性能/并发需求的场景。
 - **vLLM**：Python 生态，直接运行 Hugging Face 模型，使用官方 `vllm serve` 提供
   OpenAI 兼容 API，并原生提供 Prometheus `/metrics`。
+- **stable-diffusion.cpp**：ggml 系纯 C/C++ 扩散推理器，与 llama.cpp 同源，支持
+  SD1.x/SDXL/SD3/FLUX/Qwen-Image 等图像模型；`sd-server` 提供 `/v1/images/generations`
+  等图片接口与内置 Web UI，适合文生图/图生图（非对话）。
 
 Colab 提供的 GPU 型号不定（可能分到 **G4** 或 **T4** 等），文档针对低显存场景给出适配建议
-（llama.cpp 用 GGUF 量化、SGLang/vLLM 用显存利用率和上下文参数控制）。
+（llama.cpp 用 GGUF 量化、SGLang/vLLM 用显存利用率和上下文参数控制、sd 用更小量化档或 CPU 卸载）。
 
 ## 目录
 
 ```
 colab/
 ├── README.md              # 本文件：总体说明
-├── DOCS.md                # 完整部署教程：llama.cpp / SGLang / vLLM 安装与使用、参数、API、FAQ
+├── DOCS.md                # 完整部署教程：llama.cpp / SGLang / vLLM / stable-diffusion.cpp 安装与使用、参数、API、FAQ
 ├── Makefile               # 常用操作封装（薄封装 colab.sh）
 ├── colab.sh               # 一体化管理入口：vps / setup / install / bore / sync 子命令
 ├── bench.py               # 并发压测：sglang / llama.cpp / vLLM 通用（吞吐、延迟、并发峰值）
@@ -42,22 +45,29 @@ colab/
 │   ├── .env.cpu           # CPU profile（无 NVIDIA GPU 时自动加载）
 │   ├── launch.sh          # 服务管理：start/stop/restart/status/logs/keep
 │   └── sglang.ipynb       # Notebook 版一键部署
-└── vllm/                  # vLLM 引擎（无 Notebook）
-    ├── README.md          # vLLM 快速上手
+├── vllm/                  # vLLM 引擎（无 Notebook）
+│   ├── README.md          # vLLM 快速上手
+│   ├── .envrc             # direnv：继承根 .envrc + 按 GPU_PROFILE 加载 .env.g4/.env.t4/.env.cpu
+│   ├── .env.g4 / .env.t4  # GPU profile（VLLM_* 前缀变量）
+│   ├── .env.cpu           # CPU profile（无 NVIDIA GPU 时自动加载）
+│   └── launch.sh          # 服务管理：start/stop/restart/status/logs/keep
+└── sd/                    # stable-diffusion.cpp 引擎（文生图 / 图生图）
+    ├── README.md          # sd.cpp 部署教程（Qwen-Image-2.1 / SD1.5、编译、API）
     ├── .envrc             # direnv：继承根 .envrc + 按 GPU_PROFILE 加载 .env.g4/.env.t4/.env.cpu
-    ├── .env.g4 / .env.t4  # GPU profile（VLLM_* 前缀变量）
-    ├── .env.cpu           # CPU profile（无 NVIDIA GPU 时自动加载）
-    └── launch.sh          # 服务管理：start/stop/restart/status/logs/keep
+    ├── .env.g4 / .env.t4  # GPU profile（SD_* 前缀变量）
+    ├── .env.cpu           # CPU profile（无 NVIDIA GPU 时自动加载；默认 SD1.5 单文件）
+    └── launch.sh          # 服务管理：start/stop/restart/status/test/generate/logs/keep
 ```
 
 ## 快速开始
 
-> 完整安装与使用教程（含 llama.cpp、SGLang、vLLM 参数详解、API 示例、FAQ）见 [DOCS.md](./DOCS.md)。
+> 完整安装与使用教程（含 llama.cpp、SGLang、vLLM、stable-diffusion.cpp 参数详解、API 示例、FAQ）见 [DOCS.md](./DOCS.md)；
+> sd 的快速上手另见 [sd/README.md](./sd/README.md)。
 > 所有操作均通过根目录 `colab.sh` 统一入口执行，子命令详情见 `./colab.sh --help`。
 
 宿主机安装 Colab CLI 并创建 GPU 会话，连进 Colab terminal 后按需选择引擎：
 
-### 通用前置（三个引擎都需要）
+### 通用前置（四个引擎都需要）
 
 ```bash
 # 0. 宿主机: 创建 Colab GPU 会话并挂载 Drive, 然后连进 Colab terminal
@@ -67,7 +77,14 @@ colab/
 # 1. Colab terminal: 安装前置依赖, 加载环境变量
 ./colab.sh setup all
 source ~/.bashrc
+direnv allow .            # 允许根 .envrc(其默认值/密钥会继承给各引擎)
+
+# 2. 允许各引擎目录的 .envrc: 它们是独立文件, 根目录的 allow 不覆盖子目录
+cd sd && direnv allow . && cd ..        # sd 引擎(其余: llama / sglang / vllm 同理)
 ```
+
+> 若跳过第 2 步，首次 `cd <引擎>/` 时 direnv 会报 `direnv: error .../.envrc is blocked`，
+> 在对应目录执行 `direnv allow .` 即可（`./colab.sh setup hint` 也会打印该步骤）。
 
 ### 引擎一：SGLang（sglang/）
 
@@ -101,35 +118,50 @@ export VLLM_API_KEY=sk_xxxx
 ./colab.sh bore start                # 暴露到公网（按需）
 ```
 
-> 三个引擎默认均监听 `0.0.0.0:30000`，对外提供 OpenAI 兼容 API；公网入口为 bore 隧道地址。
-> 引擎专属环境变量（`LLAMA_*` / `SGLANG_*` / `VLLM_*`）见各引擎目录 README；日志统一写在根目录 `logs/`。
+### 引擎四：stable-diffusion.cpp（sd/，图片生成）
+
+```bash
+./colab.sh install sd              # 下载 Release Linux 通用预编译二进制（CPU）
+# ./colab.sh install sd --build      # GPU/CUDA 必须用源码编译
+cd sd && ./launch.sh start         # 首次自动下载 Qwen-Image-2.1 三件套并启动 sd-server
+./launch.sh status                 # 查看状态 + 健康检查
+./launch.sh test                   # 生成一张测试图
+./launch.sh generate "一只戴墨镜的柴犬"   # 用 sd-cli 一次性出图（不依赖服务）
+cd .. && ./colab.sh bore start     # 暴露到公网（Web UI / 图片 API）
+```
+
+> 四个引擎默认均监听 `0.0.0.0:30000`（bore 隧道固定转发本地 30000，同一时刻只跑一个），
+> 对外提供 OpenAI 兼容 API（llama.cpp/SGLang/vLLM 为文本对话，sd 为图片生成）；公网入口为 bore 隧道地址。
+> 引擎专属环境变量（`LLAMA_*` / `SGLANG_*` / `VLLM_*` / `SD_*`）见各引擎目录 README；日志统一写在根目录 `logs/`。
 
 ## 关于运行平台（G4 / T4 / CPU）
 
 Colab 免费/Pro 会话的 GPU 型号并不固定，常见有 **T4（16GB）**、**G4** 以及 L4、A100 等；
 **CPU 会话（无 NVIDIA GPU）同样支持**。脚本已按“低显存/低内存可用”设计：
 
-- 进入 `llama/`、`sglang/` 或 `vllm/` 目录时，direnv 按 `GPU_PROFILE` 加载对应 profile；
+- 进入 `llama/`、`sglang/`、`vllm/` 或 `sd/` 目录时，direnv 按 `GPU_PROFILE` 加载对应 profile；
   未设置时自动探测：探测到 NVIDIA 显卡按型号加载 `.env.g4` / `.env.t4`，
   **没有 `nvidia-smi` 或无输出则加载 `.env.cpu`**；
 - 也可显式指定（`GPU_PROFILE=g4|t4|cpu`），优先级高于自动探测；
   探测到显卡但型号未识别时不加载任何 profile（不会把 A100 之类误判成 CPU 而静默降速）；
-- 显存不足时可通过各引擎环境变量降低上下文或显存利用率（详见 [DOCS.md](./DOCS.md)）。
+- 显存不足时可通过各引擎环境变量降低上下文或显存利用率（详见 [DOCS.md](./DOCS.md)；
+  sd 见 [sd/README.md](./sd/README.md)）。
 
 ### CPU 会话注意事项
 
 - 安装：`./colab.sh install <engine>` 会自动按平台选依赖 —— GPU 装 CUDA 版 torch，
-  **CPU 装 CPU 版 torch**；`install llama --build` 在有显卡时编 CUDA 版、无显卡时编纯 CPU 版
-  （默认的官方预编译 `ubuntu-x64` 包本身就是纯 CPU 构建，两种会话都能用）。
+  **CPU 装 CPU 版 torch**；`install llama --build` / `install sd --build` 在有显卡时编 CUDA 版、
+  无显卡时编纯 CPU 版（默认的官方预编译包本身就是纯 CPU 构建，两种会话都能用）。
 - 启动：各 `launch.sh` 会自动跳过 GPU 专属参数（SGLang 的 `--attention-backend flashinfer` /
   `--kv-cache-dtype fp8_e4m3` / `--mem-fraction-static`，vLLM 的 `--gpu-memory-utilization`），
-  并改为显式传 `--device cpu`。
+  并改为显式传 `--device cpu`。sd 引擎的 CPU profile 自动改用轻量的 **SD1.5 单文件模型**（512×512）。
 - **SGLang 在 CPU 上需额外构建**：其 CPU 引擎不在 PyPI wheel 里，官方要求用
   `pyproject_cpu.toml` 源码构建（或直接用官方 `xeon.Dockerfile` 镜像），
   见 [SGLang CPU Server](https://docs.sglang.io/docs/platforms/cpu_server)。
-  `install sglang` 只装好 venv + CPU 版 torch 并打印提示。想开箱即用优先选 llama.cpp 或 vLLM。
+  `install sglang` 只装好 venv + CPU 版 torch 并打印提示。想开箱即用优先选 llama.cpp、vLLM 或 sd。
 - **必须自己换小模型**：默认的 27B/80B-MoE 模型在 CPU 会话的内存（约 12GB）里装不下。
   SGLang/vLLM 建议 `Qwen/Qwen3-8B` 量级，llama.cpp 建议 `Qwen/Qwen3-8B-GGUF` + `Q4_K_M`；
-  各 `.env.cpu` 里已给出注释开关。
+  各 `.env.cpu` 里已给出注释开关。sd 的 `.env.cpu` 默认已换成轻量的 **SD1.5 单文件**（约 4.3GB），
+  CPU 可直接跑（GPU 默认的 Qwen-Image-2.1 三件套则不建议在 CPU 上跑）。
 - 上下文：CPU 上 KV cache 走系统内存，`.env.cpu` 统一限制到 `8192`，避免按模型的
   训练上下文（可达 256K）建池而 OOM；内存充裕可按需调大。

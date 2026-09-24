@@ -41,8 +41,9 @@ source ~/.bashrc
 #    需先在根目录 .env 中写入密钥(SGLANG_API_KEY 或 API_KEY, 未设置时启动会报错)
 ./colab.sh install sglang
 
-# 3. 启动服务(进入 sglang/ 后 direnv 自动加载 GPU profile)
+# 3. 启动服务(进入 sglang/ 后 direnv 按 GPU_PROFILE 加载 profile; 首次需先允许本目录 .envrc)
 cd sglang
+direnv allow .            # 首次: 根目录的 allow 不覆盖引擎子目录
 ./launch.sh start
 
 # 4. 等待就绪(看到 HTTP 200 / "ready to roll" 即可)
@@ -136,7 +137,7 @@ print(resp.choices[0].message.content)            # 最终回答
 | 变量 | 说明 |
 |---|---|
 | `SGLANG_MODEL_REPO` | 模型路径（HF ID 或本地路径）；未设置时回退 `MODEL_REPO`（默认 `Qwen/Qwen3.8-27B`）；**两者均空时启动报错** |
-| `MODEL_ROOT` | 模型基础盘前缀（根 `.envrc`，默认 `/content/models`，**两引擎共用**）；换持久化盘改这一处即可 |
+| `MODEL_ROOT` | 模型基础盘前缀（根 `.envrc`，默认 `/content/models`，**各引擎共用**）；换持久化盘改这一处即可 |
 | `SGLANG_MODEL_ROOT` | sglang 侧基础盘前缀，未设置时回退 `MODEL_ROOT`（再兜底 `/content/models`） |
 | `SGLANG_MODEL_DIR` | 本仓库模型目录，默认 `<ROOT>/<repo名>`（按仓库隔离）；显式设置则原样使用、不再拼 ROOT。HF ID 启动时权重会 `hf download` 到该目录（持久化），命中已有目录则离线直接启动，下载失败仅告警并回退 HF ID |
 | `SGLANG_SERVED_NAME` | API 中的模型别名，默认=模型路径末段（小写、斜杠转连字符） |

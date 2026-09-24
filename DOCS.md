@@ -1,30 +1,33 @@
-# Google Colab 部署大模型完整教程（llama.cpp / SGLang / vLLM）
+# Google Colab 部署大模型完整教程（llama.cpp / SGLang / vLLM / stable-diffusion.cpp）
 
 > 目标环境：**Google Colab**（GPU 会话，可能是 **G4** 或 **T4** 显卡）/ Ubuntu Linux
-> 服务形态：OpenAI 兼容 API，支持深度思考、工具调用、投机解码等
+> 服务形态：OpenAI 兼容 API（文本对话 / 图片生成），支持深度思考、工具调用、投机解码等
 >
-> 本教程提供 **三套可选推理引擎**：
+> 本教程提供 **四套可选推理引擎**：
 > - **llama.cpp**：单文件 `llama-server`，GGUF 模型，显存占用低、上手快，适合 G4/T4 有限显存；
 > - **SGLang**：Python 生态，高吞吐、多功能（深度思考 / 工具调用 / EAGLE 投机解码）；
-> - **vLLM**：Python 生态，直接运行 Hugging Face 模型，使用官方 `vllm serve` 提供高吞吐 OpenAI 兼容服务。
+> - **vLLM**：Python 生态，直接运行 Hugging Face 模型，使用官方 `vllm serve` 提供高吞吐 OpenAI 兼容服务；
+> - **stable-diffusion.cpp**：ggml 系纯 C/C++ 扩散推理器，`sd-server` 提供 OpenAI 风格的图片接口与 Web UI，用于文生图/图生图。
 >
-> 三者都能对外提供 OpenAI 兼容 API，可按需求选择（见下方「如何选择」）。
+> 前三者提供 **文本对话** OpenAI 兼容 API，sd 提供 **图片生成** 接口，可按需求选择（见下方「如何选择」）。
 
 ---
 
 ## 如何选择
 
-| 维度 | llama.cpp | SGLang | vLLM |
-|---|---|---|---|
-| 安装 | 编译 CUDA 版或下载预编译二进制 | `pip install sglang`（Python venv） | 官方最新 vLLM（Python venv） |
-| 模型格式 | **GGUF**（需量化/转换） | HF safetensors（原格式直接跑） | HF safetensors（原格式直接跑） |
-| 显存占用 | 低（GGUF 量化到 Q4 等） | 中等（fp8 KV 量化） | 由 `--gpu-memory-utilization` 控制 |
-| 上手难度 | ★（单命令启动） | ★★★（参数多、自动推导） | ★★（官方 `vllm serve`） |
-| 深度思考 / 工具调用 | 支持（需对应模板） | 支持（解析器更完善） | 随模型和 vLLM 版本支持 |
-| 高并发 / 高吞吐 | 一般 | 强（连续 batching、投机解码） | 强（连续 batching） |
-| 适用场景 | G4/T4 低显存、快速起服务 | 追求性能、多并发、复杂功能 | HF 模型、高吞吐、标准 API |
+| 维度 | llama.cpp | SGLang | vLLM | stable-diffusion.cpp |
+|---|---|---|---|---|
+| 主要用途 | 文本对话 | 文本对话 | 文本对话 | **图片生成（文生图/图生图）** |
+| 安装 | 编译 CUDA 版或下载预编译二进制 | `pip install sglang`（Python venv） | 官方最新 vLLM（Python venv） | 源码编译 CUDA 版或下载 Release 预编译二进制（CPU） |
+| 模型格式 | **GGUF**（需量化/转换） | HF safetensors（原格式直接跑） | HF safetensors（原格式直接跑） | GGUF / safetensors / ckpt |
+| 显存占用 | 低（GGUF 量化到 Q4 等） | 中等（fp8 KV 量化） | 由 `--gpu-memory-utilization` 控制 | 低（GGUF 量化，可 `--offload-to-cpu`） |
+| 上手难度 | ★（单命令启动） | ★★★（参数多、自动推导） | ★★（官方 `vllm serve`） | ★★（组件式模型 + 编译） |
+| 深度思考 / 工具调用 | 支持（需对应模板） | 支持（解析器更完善） | 随模型和 vLLM 版本支持 | 不适用（图片生成） |
+| 高并发 / 高吞吐 | 一般 | 强（连续 batching、投机解码） | 强（连续 batching） | 一般（逐张出图，无对话并发语义） |
+| 适用场景 | G4/T4 低显存、快速起服务 | 追求性能、多并发、复杂功能 | HF 模型、高吞吐、标准 API | Qwen-Image / FLUX / SD 系列出图 |
 
-> 简单判断：**图省事、显存小 → llama.cpp**；**要 SGLang 特性 → SGLang**；**要标准 vLLM 服务 → vLLM**。
+> 简单判断：**文本对话** —— 图省事、显存小 → llama.cpp，要 SGLang 特性 → SGLang，要标准 vLLM 服务 → vLLM；
+> **图片生成** → stable-diffusion.cpp。
 
 ---
 
@@ -51,6 +54,13 @@
 - [C4 vLLM API 与监控](#c4-vllm-api-与监控)
 - [C5 vLLM 压测与调优](#c5-vllm-压测与调优)
 
+**Part D：stable-diffusion.cpp（图片生成）**
+- [D1 安装 stable-diffusion.cpp](#d1-安装-stable-diffusioncpp)
+- [D2 获取模型权重](#d2-获取模型权重)
+- [D3 启动 sd-server](#d3-启动-sd-server)
+- [D4 sd 参数详解](#d4-sd-参数详解)
+- [D5 sd API 使用示例](#d5-sd-api-使用示例)
+
 **通用**
 - [0. 运行平台与 profile（G4 / T4 / CPU）](#0-运行平台与-profile)
 - [5. 模型存放：冷存储（Drive）vs 本地盘](#5-模型存放冷存储google-drive-vs-本地盘)
@@ -61,7 +71,7 @@
 
 ## 0. 运行平台与 profile
 
-三个引擎都通过 **profile 文件**适配运行平台，文件位于各引擎目录下：`.env.g4` / `.env.t4` / `.env.cpu`。
+四个引擎都通过 **profile 文件**适配运行平台，文件位于各引擎目录下：`.env.g4` / `.env.t4` / `.env.cpu`。
 
 加载优先级（各引擎的 `.envrc` 与 `launch.sh` 判定逻辑一致）：
 
@@ -77,9 +87,9 @@ GPU_PROFILE=cpu ./colab.sh install vllm     # 有显卡也强制按 CPU 装
 ### CPU 会话（无 NVIDIA GPU）
 
 **安装**：`./colab.sh install <engine>` 已按平台自动选依赖 —— GPU 装 CUDA 版 torch，
-**CPU 装 CPU 版 torch**（`--torch-backend=cpu`）；`install llama --build` 在有显卡时编 CUDA 版
-（`-DGGML_CUDA=ON`）、无显卡时编纯 CPU 版且不再要求 `nvcc`。默认的官方预编译 `ubuntu-x64`
-包本身就是纯 CPU 构建，两种会话都能直接用。
+**CPU 装 CPU 版 torch**（`--torch-backend=cpu`）；`install llama --build` / `install sd --build`
+在有显卡时编 CUDA 版（`-DGGML_CUDA=ON` / `-DSD_CUDA=ON`）、无显卡时编纯 CPU 版且不再要求 `nvcc`。
+默认的官方预编译包本身就是纯 CPU 构建（llama 的 `ubuntu-x64`、sd 的 `bin-Linux-Ubuntu*-x86_64.zip`），两种会话都能直接用。
 
 **启动**：各 `launch.sh` 在 CPU 平台自动跳过 GPU 专属参数，并显式传 `--device cpu`：
 
@@ -88,23 +98,26 @@ GPU_PROFILE=cpu ./colab.sh install vllm     # 有显卡也强制按 CPU 装
 | SGLang | `--attention-backend flashinfer`、`--kv-cache-dtype fp8_e4m3`、`--mem-fraction-static`；不导出 `FLASHINFER_CUDA_ARCH_LIST` | `--device cpu` + `--disable-overlap-schedule`，并 export `SGLANG_USE_CPU_ENGINE=1` |
 | vLLM | `--gpu-memory-utilization`；不做 FlashInfer 架构探测 | `--device cpu`（`VLLM_DEVICE`）+ `VLLM_CPU_KVCACHE_SPACE` |
 | llama.cpp | 仅把 `-ngl` 降为 0（GPU 专属参数本身就没有） | `-t`（`LLAMA_THREADS`，默认不传交给 llama.cpp 自定） |
+| sd | 不传 `--diffusion-fa`（CPU 无原生 FA，且默认本就关闭） | `.env.cpu` 换用轻量 **SD1.5 单文件**（512×512）+ `SD_THREADS` 线程数 |
 
 > **SGLang 在 CPU 上需要额外安装步骤**：它的 CPU 引擎不在 PyPI 的 `sglang` wheel 里，
 > 官方要求用 `pyproject_cpu.toml` 从源码构建 `sglang` 与 `sgl-kernel`（或直接用官方
 > `sglang/docker` 下的 `xeon.Dockerfile` 镜像），见
 > [SGLang CPU Server](https://docs.sglang.io/docs/platforms/cpu_server)。
 > `./colab.sh install sglang` 在 CPU 平台会装好 venv + CPU 版 torch 并打印该提示，但不会
-> 替你做源码构建。想开箱即用请优先选 llama.cpp 或 vLLM。
+> 替你做源码构建。想开箱即用请优先选 llama.cpp、vLLM 或 sd。
 
 **必须自己换小模型**：默认的 27B 稠密 / 80B-A3B MoE 模型在 CPU 会话的内存（约 12GB）里装不下。
 SGLang/vLLM 建议 `Qwen/Qwen3-8B` 量级，llama.cpp 建议 `Qwen/Qwen3-8B-GGUF` + `Q4_K_M`
-（各 `.env.cpu` 里已给出注释开关，取消注释即可）。
+（各 `.env.cpu` 里已给出注释开关，取消注释即可）。sd 的 `.env.cpu` 默认已换成轻量的
+**SD1.5 单文件 safetensors**（约 4.3GB），CPU 可直接跑；GPU 默认的 Qwen-Image-2.1 三件套不建议在 CPU 上跑。
 
 **上下文**：CPU 上 KV cache 走系统内存，`.env.cpu` 统一限制到 `8192`。不限制的话会按模型的
 训练上下文（Qwen3 可达 256K）建池，几十 GB 内存直接打满。内存充裕可按需调大。
 
 > CPU 上吞吐比 GPU 低一到两个数量级，建议只用于功能验证；SGLang 的 CPU 后端覆盖度不如
-> vLLM / llama.cpp，遇到问题优先换这两个引擎。
+> vLLM / llama.cpp，遇到问题优先换这两个引擎。sd 在 CPU 上出图同样远慢于 GPU（其 `.env.cpu`
+> 默认已换成轻量 SD1.5；Qwen-Image-2.1 三件套不建议在 CPU 上跑）。
 
 ---
 
@@ -681,20 +694,237 @@ make vllm-bench BENCH_ARGS="-n 8 --max-tokens 128"
 
 **`Default vLLM sampling parameters have been overridden by the model's generation_config.json`**：这是模型作者推荐的采样参数（Qwen 为 temperature 1.0 / top_k 20 / top_p 0.95），按默认保留即可；想改用 vLLM 默认采样时设 `VLLM_GENERATION_CONFIG=vllm`。
 
+---
+
+# Part D：stable-diffusion.cpp（图片生成）
+
+> **项目已内置一键脚本**：`./colab.sh install sd` 默认下载 GitHub Release 的 Linux 通用预编译二进制（CPU）；
+> GPU/CUDA 用 `./colab.sh install sd --build` 源码编译；`sd/launch.sh` 管理服务（下载模型、启动/停止/状态、一次性出图等）。
+> 直接使用即可（见 [sd/README.md](./sd/README.md)）。下方为完整说明。
+
+## D1. 安装 stable-diffusion.cpp
+
+### D1.1 方式一：Release 预编译二进制（默认，仅 CPU）
+
+```bash
+./colab.sh install sd
+```
+
+脚本会取 GitHub Release 中最新且匹配 `bin-Linux-Ubuntu*-x86_64.zip` 的资产（排除 Vulkan/ROCm），
+解压 `sd-cli` / `sd-server` 到 `/content/stable-diffusion.cpp/build/bin/`。
+
+> Linux 预编译包只有 CPU / Vulkan / ROCm，**没有 CUDA 版**；GPU 用户必须用下面的源码编译。
+
+### D1.2 方式二：源码编译（GPU/CUDA 必须）
+
+```bash
+./colab.sh install sd --build
+```
+
+等价于官方 [build.md](https://github.com/leejet/stable-diffusion.cpp/blob/master/docs/build.md) 的 CUDA 构建：
+
+```bash
+git clone --recursive https://github.com/leejet/stable-diffusion.cpp
+cd stable-diffusion.cpp
+mkdir build && cd build
+cmake .. -DSD_CUDA=ON          # G4/T4 GPU; 纯 CPU 去掉这一项
+cmake --build . --config Release
+# 生成的可执行文件在 build/bin/ 下: sd-cli / sd-server
+```
+
+> **子模块**：`git clone --recursive` 会拉取 `ggml` / `thirdparty/libwebp` / `thirdparty/libwebm`；
+> 项目脚本只初始化这三个（前端子模块按需）。未初始化时 CMake 会报
+> `WebP support enabled but no source found`，重跑安装即可。
+>
+> **CUDA 架构**：`-DSD_CUDA=ON` 时 ggml 默认用 `native`（构建时 GPU）自动探测；如需显式指定，
+> 可 `SD_CUDA_ARCH=120 ./colab.sh install sd --build`（G4 Blackwell sm_120）。
+> 另可用 `SD_SERVER_BUILD_FRONTEND=1` 额外构建内嵌 Web UI（需 Node.js + pnpm），`CLEAN=1` 清 build 重编。
+
+### D1.3 验证
+
+```bash
+ls /content/stable-diffusion.cpp/build/bin/          # sd-cli  sd-server
+/content/stable-diffusion.cpp/build/bin/sd-server --version
+```
+
+---
+
+## D2. 获取模型权重
+
+sd.cpp 的权重支持 GGUF / safetensors / ckpt。加载方式有两种：
+
+- **单文件全模型**（`-m/--model`）：如 SD1.5/SD3 的 `*.safetensors`，无需额外组件；
+- **组件式**（`--diffusion-model` + `--vae` + `--llm`）：如 FLUX / Qwen-Image，主干、VAE、文本编码器分开。
+
+> 项目脚本已封装修拉流程：`sd/launch.sh start` 会按 `<VAR>_REPO`/`<VAR>_FILE` 用 `hf download`
+> 自动下载到本地工作盘（`/content/models/<仓库名>/`，按仓库分目录隔离），本地已存在则不联网。
+
+### D2.1 默认（G4）：Qwen-Image-2.1 三件套
+
+| 组件 | flag | HF 仓库 | 文件 |
+|---|---|---|---|
+| 扩散主干 | `--diffusion-model` | `unsloth/Qwen-Image-2.1-GGUF` | `qwen-image-2.1-Q4_K_M.gguf` |
+| VAE | `--vae` | `unsloth/Qwen-Image-2.1-FP8` | `vae/qwen_image_2.1_vae_bf16.safetensors` |
+| 文本编码器 | `--llm` | `unsloth/Qwen3-VL-8B-Instruct-GGUF` | `Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf` |
+
+> Qwen-Image-2.1 **必须**配它自己的 VAE（`qwen_image_2.1_vae_bf16.safetensors`），旧的
+> Qwen-Image / Wan2.2 VAE 不通用。图生图/编辑还需视觉投影器（`--llm_vision`，默认不下载）。
+
+### D2.2 CPU 默认：SD1.5 单文件
+
+`sd/.env.cpu` 默认 `stable-diffusion-v1-5/stable-diffusion-v1-5` 的
+`v1-5-pruned-emaonly.safetensors`（约 4.3GB），用 `-m` 单文件加载。
+
+### D2.3 手动下载（可选）
+
+```bash
+uv pip install --system --upgrade huggingface_hub hf_xet
+hf download unsloth/Qwen-Image-2.1-GGUF \
+  --include "qwen-image-2.1-Q4_K_M.gguf" \
+  --local-dir /content/models/Qwen-Image-2.1-GGUF
+```
+
+公开仓库无需 token；gated 仓库需 `export HF_TOKEN=hf_xxx` 并接受许可证。
+
+---
+
+## D3. 启动 sd-server
+
+`sd/launch.sh` 一键管理服务（`sd-server` 提供 HTTP API 与 Web UI）：
+
+```bash
+cd sd
+./launch.sh start      # 启动 sd-server(后台 setsid 托管; 首次自动下载模型)
+./launch.sh stop       # 优雅停止，超时强杀
+./launch.sh restart    # 重启
+./launch.sh status     # 进程 + 健康检查(curl /v1/models)
+./launch.sh test       # 调用服务生成一张测试图
+./launch.sh generate "一只戴墨镜的柴犬"   # 用 sd-cli 一次性出图(不依赖服务)
+./launch.sh logs       # 实时跟踪日志
+./launch.sh keep       # 守护模式：崩溃自动拉起
+```
+
+也可经根目录统一入口调用：`./colab.sh sd start`、`make sd-start`。
+
+启动参数由脚本按 profile 拼装，等价命令形如：
+
+```bash
+sd-server \
+  --diffusion-model <主干.gguf> --vae <vae.safetensors> --llm <文本编码器.gguf> \
+  --steps 20 --cfg-scale 6.0 --sampling-method euler -W 1024 -H 1024 --diffusion-fa \
+  -l 0.0.0.0 --listen-port 30000
+```
+
+服务默认监听 `0.0.0.0:30000`（与 bore 隧道本地端口一致），日志为根目录 `logs/sd_server.log`
+（PID `sd/sd.pid`，启动命令追加 `logs/launch_cmd.log`）。进入 `sd/` 时 `.envrc` 自动加载 profile
+（`.env.g4`/`.env.t4`/`.env.cpu`，见[第 0 节](#0-运行平台与-profile)）。
+
+> **端口冲突**：四个引擎默认都用 30000，同一时刻只跑一个（bore 固定转发本地 30000）；如需并存可改 `SD_PORT`。
+
+---
+
+## D4. sd 参数详解
+
+脚本把环境变量拼装成 `sd-server` / `sd-cli` 参数（避免字符串拼接错位）：
+
+| sd.cpp 参数 | 环境变量 | 说明 |
+|---|---|---|
+| `--diffusion-model` | `SD_DIFFUSION_MODEL`（或 `_REPO`/`_FILE`） | 组件式扩散主干 |
+| `-m, --model` | `SD_MODEL`（或 `_REPO`/`_FILE`） | 单文件全模型（与上者至少配一个） |
+| `--vae` | `SD_VAE`（或 `_REPO`/`_FILE`） | 独立 VAE |
+| `--llm` | `SD_LLM`（或 `_REPO`/`_FILE`） | 文本编码器（Qwen-Image 用 Qwen3-VL） |
+| `--llm_vision` | `SD_LLM_VISION`（或 `_REPO`/`_FILE`） | 视觉投影器（图生图/编辑，可选） |
+| `--clip_l` / `--clip_g` / `--t5xxl` | `SD_CLIP_L` / `SD_CLIP_G` / `SD_T5XXL` | SD3/FLUX 的文本编码器（可选） |
+| `--steps` | `SD_STEPS` | 采样步数（留空不传，由模型决定） |
+| `--cfg-scale` | `SD_CFG_SCALE` | CFG 强度 |
+| `--sampling-method` | `SD_SAMPLING_METHOD` | 采样器（`euler` / `euler_a` 等） |
+| `-W` / `-H` | `SD_WIDTH` / `SD_HEIGHT` | 默认分辨率（建议能被 32 整除） |
+| `--seed` / `--scheduler` / `--flow-shift` / `--negative-prompt` | `SD_SEED` / `SD_SCHEDULER` / `SD_FLOW_SHIFT` / `SD_NEGATIVE_PROMPT` | 可选生成参数 |
+| `--diffusion-fa` | `SD_DIFFUSION_FA=1` | 扩散模型启用 Flash Attention |
+| `--offload-to-cpu` | `SD_OFFLOAD_TO_CPU=1` | 权重放内存按需换入显存（省显存） |
+| `--vae-tiling` | `SD_VAE_TILING=1` | VAE 分块解码省显存 |
+| `-t` | `SD_THREADS` | CPU 线程数（`-1`/空=由 sd.cpp 决定） |
+| `--lora-model-dir` | `SD_LORA_DIR` | LoRA 目录 |
+| `--log-level` | `SD_LOG_LEVEL` | 日志级别（`debug`/`verbose`/`info`/`warn`/`error`；留空用默认 `info`） |
+| `-b, --batch-count` | `SD_BATCH_COUNT` | **仅 generate**：一次出图张数（>1 时输出名带 `%02d`） |
+| `-l, --listen-ip` / `--listen-port` | `SD_HOST` / `SD_PORT` | 监听地址与端口（默认 `0.0.0.0:30000`） |
+
+其它：`SD_DIR`（安装目录）、`SD_SERVER`/`SD_CLI`（二进制路径）、`SD_MODEL_ROOT`（模型盘前缀，回退 `MODEL_ROOT`）、
+`SD_OUTPUT_DIR`（出图目录，默认 `/content/outputs`）、`SD_PROMPT`（默认提示词）、
+`SD_REQUEST_TIMEOUT`（test 请求超时秒数，默认 1800）、`SD_XET`（默认 1）。
+`generate` 另会传 `-M img_gen`、`-p <提示词>`、`-o <输出路径>`。
+
+> **G4/T4 低显存调优**：显存不足 → `SD_OFFLOAD_TO_CPU=1`、`SD_VAE_TILING=1`，
+> 或降低 `SD_WIDTH/SD_HEIGHT`、换更小量化档（如 `qwen-image-2.1-Q4_K_S.gguf`）。
+
+---
+
+## D5. sd API 使用示例
+
+`sd-server` 同时提供三套 HTTP API，base_url 为 `http://<主机>:30000`（无鉴权）。
+
+### D5.1 OpenAI 风格图片接口
+
+```bash
+curl -s http://localhost:30000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a lovely cat", "size": "1024x1024", "n": 1, "output_format": "png"}' \
+  | python3 -c 'import sys,json,base64; d=json.load(sys.stdin); open("out.png","wb").write(base64.b64decode(d["data"][0]["b64_json"]))'
+```
+
+返回 `data[].b64_json`（PNG 的 base64）。`size` 为 `宽x高`，`n` 为张数。
+
+### D5.2 A1111 风格接口
+
+```bash
+curl -s http://localhost:30000/sdapi/v1/txt2img \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a lovely cat", "width": 1024, "height": 1024, "steps": 20, "cfg_scale": 6.0, "sampler_name": "Euler"}'
+```
+
+### D5.3 Web UI 与原生 API
+
+- Web UI：`http://localhost:30000/`（需安装时开启 `SD_SERVER_BUILD_FRONTEND=1`）
+- 原生异步 API：`POST /sdcpp/v1/img_gen`、`GET /sdcpp/v1/capabilities`、`GET /sdcpp/v1/jobs/<id>`
+- 模型/健康：`GET /v1/models`
+
+### D5.4 一次性出图（sd-cli，不走服务）
+
+```bash
+cd sd
+./launch.sh generate "一只戴墨镜的柴犬"                    # -> /content/outputs/sd_<时间戳>.png
+SD_STEPS=30 SD_WIDTH=768 SD_HEIGHT=768 ./launch.sh generate "水彩风格的雪山"
+./colab.sh sd generate "a red fox"                          # 等价入口
+make sd-generate PROMPT="a red fox"
+```
+
+### D5.5 公网访问（bore 隧道）
+
+```bash
+cd /content/colab
+./colab.sh bore start          # 本地 30000 -> 公网 65535
+./colab.sh bore logs           # 查看分配到的公网地址
+```
+
+> **sd 不适用 `bench.py`**：`bench.py` 是针对文本对话的并发压测；sd 没有 `bench` 子命令
+> （`./colab.sh sd bench` 会直接报错）。需要压并发出图时，自行并发请求 `/v1/images/generations` 即可。
+
+---
+
 ## 5. 模型存放：冷存储（Google Drive）vs 本地盘
 
 > **结论：不要让引擎直接从 Drive 加载权重。** Drive 在 Colab 里是 FUSE 挂载，
-> 顺序读只有几十 MB/s 且抖动大；而 llama.cpp / SGLang 加载权重用的是 `mmap` 随机读，
+> 顺序读只有几十 MB/s 且抖动大；而引擎加载权重需要连续读入数 GB ~ 数十 GB（llama.cpp 更是 mmap 随机读），
 > 延迟在 FUSE 上会被放大 —— 30GB 的权重可能从数十秒变成十几分钟，表现得像卡死
 > （挂载再抖一下，进程还可能进入 uninterruptible sleep，kill 都杀不掉）。
 
 因此引擎**不支持把 Drive 用作模型目录**：模型目录（含通过 `MODEL_ROOT` / `LLAMA_MODEL_ROOT` /
-`SGLANG_MODEL_ROOT` 间接指向）以 `/content/drive` 开头时，`launch.sh start` 直接报错退出；
-脚本也**不会自动复制/降级**任何文件。Drive 只作为冷存储，权重的搬运完全由手动
-`./colab.sh sync` 完成（见下）。
+`SGLANG_MODEL_ROOT` / `VLLM_MODEL_ROOT` / `SD_MODEL_ROOT` 间接指向）以 `/content/drive` 开头时，
+`launch.sh start` 直接报错退出；脚本也**不会自动复制/降级**任何文件。Drive 只作为冷存储，
+权重的搬运完全由手动 `./colab.sh sync` 完成（见下）。
 
 ```bash
-# 根 .envrc（两引擎共用）—— 模型一律放本地盘
+# 根 .envrc（各引擎共用）—— 模型一律放本地盘
 export MODEL_ROOT="/content/models"                    # 本地模型盘：引擎从这里加载
 
 # ./colab.sh sync 专用（默认值即可用，无需显式设置）
@@ -718,12 +948,16 @@ export MODEL_LOCAL_ROOT="/content/models"                    # 本地工作盘�
 ./colab.sh sync pull -n                        # 预览：Drive 上有哪些模型会拉到本地
 ./colab.sh sync pull Qwen3.8-27B-GGUF --quant UD-Q8_K_XL   # 只拉这一个量化档（推荐）
 ./colab.sh sync push Qwen3.8-27B-GGUF          # 把本地下好的权重回存到 Drive
+./colab.sh sync pull Qwen-Image-2.1-GGUF --quant Q4_K_M    # sd 扩散主干（仓库目录名 + 量化档）
+./colab.sh sync pull Qwen-Image-2.1-FP8                    # sd 的 VAE（无档位，省略 --quant）
 ./colab.sh sync all                            # 双向各取较新的一方（先 pull 再 push）
 ```
 
 **从云端取回时请带 `--quant <档位>`**：只同步 `*-<档位>-*.gguf` / `*-<档位>.gguf`，
 免得把目录里 BF16 等几十 GB 的其它档位一起搬下来。省略 `--quant` 会同步整个模型目录，
 此时脚本会打印提示——SGLang 的 safetensors 权重没有档位概念，那种情况就该省略。
+sd 的扩散主干 GGUF 也按档位命名（如 `qwen-image-2.1-Q4_K_M.gguf`），同样可用 `--quant Q4_K_M`；
+而 sd 的 VAE / 文本编码器分属不同仓库目录，按仓库目录名分别同步即可。
 
 | 动作 | 方向 |
 |---|---|
@@ -750,19 +984,33 @@ export MODEL_LOCAL_ROOT="/content/models"                    # 本地工作盘�
 # llama.cpp (端口 30000)
 tail -f ./logs/llama_server.log           # 日志(根目录 logs/)
 curl http://localhost:30000/health        # 健康
+curl -H "Authorization: Bearer $LLAMA_API_KEY" \
+     http://localhost:30000/metrics       # Prometheus 指标(默认开启, LLAMA_METRICS=0 关闭)
 
 # SGLang (端口 30000)
 tail -f ./logs/sglang_server.log          # 日志(根目录 logs/)
 curl http://localhost:30000/health        # 健康
-curl http://localhost:30000/metrics       # Prometheus 指标
+curl -H "Authorization: Bearer $SGLANG_API_KEY" \
+     http://localhost:30000/metrics       # Prometheus 指标
 
 # vLLM (端口 30000)
 tail -f ./logs/vllm_server.log            # 日志(根目录 logs/)
 curl http://localhost:30000/health        # 健康
 curl -H "Authorization: Bearer $VLLM_API_KEY" http://localhost:30000/metrics
 
+# sd / stable-diffusion.cpp (端口 30000)
+tail -f ./logs/sd_server.log              # 日志(根目录 logs/)
+curl http://localhost:30000/v1/models     # 健康(返回 200 即就绪; sd 无 /health 端点)
+curl http://localhost:30000/              # Web UI(构建前端时返回网页, 否则纯文本提示)
+./colab.sh sd test                        # 生成一张测试图(端到端烟测)
+# 注: sd 无 Prometheus /metrics 端点
+
 nvidia-smi                               # 显存占用
 ```
+
+> `/health` 是各引擎的就绪探测端点（无需鉴权）；`/metrics` 在开启 API 鉴权的引擎
+> （llama.cpp / SGLang / vLLM）需带 `Authorization: Bearer <密钥>`（未启鉴权时可省略该 header）。
+> sd 既无 `/health` 也无 `/metrics`，就绪探测用 `/v1/models`（见上）。
 
 ---
 
@@ -771,7 +1019,8 @@ nvidia-smi                               # 显存占用
 **Q1: Colab GPU 到底是 G4 还是 T4？**
 型号不固定，用 `nvidia-smi` 或 `python -c "import torch;print(torch.cuda.get_device_name(0))"`
 查询。不同型号架构不同（G4=Ada sm_89、T4=Turing sm_75、Blackwell=sm_120），影响
-`FLASHINFER_CUDA_ARCH_LIST` 与 llama.cpp 的 `-DCMAKE_CUDA_ARCHITECTURES` 取值。
+`FLASHINFER_CUDA_ARCH_LIST`、llama.cpp 的 `-DCMAKE_CUDA_ARCHITECTURES` 与 sd 的
+`SD_CUDA_ARCH` 取值（sd 默认交由 ggml 的 `native` 在构建时自动探测，一般无需手动指定）。
 
 **Q2: llama.cpp 启动报 CUDA 相关错误？**
 确认使用的是 CUDA 源码编译版；执行 `./colab.sh install llama --build`（或用 `-DGGML_CUDA=on` 手动重编）；
@@ -780,10 +1029,12 @@ nvidia-smi                               # 显存占用
 **Q3: 显存不足（OOM）怎么办？**
 - llama.cpp：降 GGUF 量化（Q4）、减小 `--ctx-size`、减小 `-ngl`、降 `--parallel`；
 - SGLang：降 `--mem-fraction-static` 到 0.85、KV 用 fp8、换更小模型；
-- vLLM：降低 `VLLM_MAX_MODEL_LEN`、`VLLM_GPU_MEMORY_UTILIZATION` 或 `VLLM_MAX_NUM_SEQS`，必要时换更小/量化模型。
+- vLLM：降低 `VLLM_MAX_MODEL_LEN`、`VLLM_GPU_MEMORY_UTILIZATION` 或 `VLLM_MAX_NUM_SEQS`，必要时换更小/量化模型；
+- sd：`SD_OFFLOAD_TO_CPU=1`、`SD_VAE_TILING=1`，降低 `SD_WIDTH/SD_HEIGHT` 或换更小量化档（如 `Q4_K_S`）。
 
-**Q4: 选 llama.cpp、SGLang 还是 vLLM？**
-显存小/图省事选 llama.cpp；要 SGLang 的解析器、投机解码等功能选 SGLang；要直接运行 HF 模型并使用标准 vLLM 服务选 vLLM。
+**Q4: 选 llama.cpp、SGLang、vLLM 还是 stable-diffusion.cpp？**
+**文本对话**：显存小/图省事选 llama.cpp；要 SGLang 的解析器、投机解码等功能选 SGLang；要直接运行 HF 模型并使用标准 vLLM 服务选 vLLM。
+**图片生成**（文生图/图生图）选 stable-diffusion.cpp（见 [Part D](#part-dstable-diffusioncpp图片生成) 与 [sd/README.md](./sd/README.md)）。
 
 **Q5: SGLang 启动报 `FlashInfer requires GPUs with sm75 or higher`？**
 架构没传对，或 nvcc 太旧编不出 `compute_120f`：需 `FLASHINFER_CUDA_ARCH_LIST`（注意无
@@ -805,11 +1056,12 @@ Mamba 状态缓存限制。调大 `--mamba-full-memory-ratio`（如 0.5），或
 
 **Q10: 首次请求特别慢？**
 FlashInfer 首次 JIT 编译内核（几分钟，之后有缓存）；llama.cpp 首次加载 GGUF、vLLM 首次加载权重和 CUDA graph warmup 也需时间。
-均属正常。
+sd 首次加载权重（尤其 Qwen-Image-2.1 三件套）同样需要时间。均属正常。
 
 **Q11: 请求返回 `401 Unauthorized`？**
 服务已启用 Bearer 鉴权，客户端必须带 `Authorization: Bearer <密钥>`。
 密钥由 `SGLANG_API_KEY`、`VLLM_API_KEY` 或 `LLAMA_API_KEY`（各自回退 `API_KEY`）决定。显式设置引擎密钥为空可关闭该引擎鉴权。
+sd（`sd-server`）默认**无鉴权**，不在此列（见 Q17）。
 
 **Q12: 上下文不够长？**
 - llama.cpp：增大 `--ctx-size`（显存有限，配合 YARN/rope-scaling 可外推）；
@@ -821,3 +1073,19 @@ FlashInfer 首次 JIT 编译内核（几分钟，之后有缓存）；llama.cpp 
 模型目录以 `/content/drive` 开头时启动直接报错。先用 `./colab.sh sync pull <模型名>
 --quant <档位>` 把权重取到本地盘（默认 `/content/models`）再启动。详见
 [第 5 节](#5-模型存放冷存储google-drive-vs-本地盘)。
+
+**Q14: sd 在 GPU 会话跑得很慢 / 报 `no CUDA-capable device`？**
+默认的 `./colab.sh install sd` 装的是 Release **纯 CPU** 预编译包。GPU 用户请用
+`./colab.sh install sd --build` 重新编译 CUDA 版；架构异常时可 `SD_CUDA_ARCH=120 ./colab.sh install sd --build`（G4 Blackwell）。
+
+**Q15: `install sd --build` 报 `WebP support enabled but no source found`？**
+子模块没初始化。脚本会执行 `git submodule update --init --recursive ggml thirdparty/libwebp thirdparty/libwebm`，
+重跑安装即可；也可用 `-DSD_WEBP=OFF -DSD_WEBM=OFF` 跳过（但失去 WebP/WebM 输出）。
+
+**Q16: sd 出图是全黑 / 全白？**
+多为分辨率或采样参数与该模型不匹配。Qwen-Image-2.1 参考 `SD_CFG_SCALE=6.0`、
+`SD_STEPS=20`、`SD_SAMPLING_METHOD=euler`，分辨率需能被 32 整除（`SD_WIDTH/SD_HEIGHT`）。
+
+**Q17: sd 服务需要 API 密钥吗？四个引擎能同时跑吗？**
+`sd-server` 默认**无鉴权**（没有 `--api-key` 参数），对外暴露时请在隧道/反代层自行加访问控制。
+四个引擎默认都用本地 30000 端口（bore 固定转发本地 30000），同一时刻只跑一个；需要并存时改对应 `*_PORT`。

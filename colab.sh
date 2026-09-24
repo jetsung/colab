@@ -6,10 +6,11 @@
 # 子命令:
 #   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
 #   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
-#   install <engine> [--build|-B]       Colab 内: 安装并启用引擎环境(engine: llama | sglang | vllm; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
+#   install <engine> [--build|-B]       Colab 内: 安装并启用引擎环境(engine: llama | sglang | vllm | sd; llama/sd 默认 GitHub Release 通用预编译二进制, --build 编译源码)
 #   llama start|stop|restart|status|test|bench|logs|keep   Colab 内: llama.cpp 服务管理(透传 llama/launch.sh)
 #   sglang start|stop|restart|status|test|bench|logs|keep  Colab 内: SGLang 服务管理(透传 sglang/launch.sh)
 #   vllm start|stop|restart|status|test|bench|logs|keep    Colab 内: vLLM 服务管理(透传 vllm/launch.sh)
+#   sd start|stop|restart|status|test|generate|logs|keep   Colab 内: stable-diffusion.cpp 服务管理(透传 sd/launch.sh)
 #   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
 #   sync pull|push|all [模型名...]        Colab 内: 手动同步本地工作盘 <-> Drive 冷存储(引擎不会自动复制; 见 sync -h)
 #
@@ -64,10 +65,11 @@ usage_root() {
 子命令:
   vps <动作>                            宿主机: 安装 Colab CLI / 建 GPU 会话 / 挂 Drive (动作见 vps -h)
   setup <动作>                          Colab 内: 装前置依赖(direnv/bore/relaydrop/opencode/codebuddy, 动作见 setup -h)
-  install <engine> [--build|-B]          Colab 内: 安装并启用引擎环境(engine: llama | sglang | vllm; llama 默认 GitHub 最新 prerelease 通用预编译二进制, --build 编译源码)
+  install <engine> [--build|-B]          Colab 内: 安装并启用引擎环境(engine: llama | sglang | vllm | sd; llama/sd 默认 GitHub Release 通用预编译二进制, --build 编译源码)
   llama start|stop|restart|status|test|bench|logs|keep   Colab 内: llama.cpp 服务管理(动作见 llama -h)
   sglang start|stop|restart|status|test|bench|logs|keep  Colab 内: SGLang 服务管理(动作见 sglang -h)
   vllm start|stop|restart|status|test|bench|logs|keep    Colab 内: vLLM 服务管理(动作见 vllm -h)
+  sd start|stop|restart|status|test|generate|logs|keep   Colab 内: stable-diffusion.cpp 服务管理(动作见 sd -h)
   bore start|stop|restart|status|logs   Colab 内: 公网隧道管理(setsid 后台托管)
   sync pull|push|all [模型名...]        Colab 内: 手动同步本地工作盘 <-> Drive 冷存储(引擎不会自动复制; 见 sync -h)
   help | -h | --help                    查看本帮助
@@ -81,6 +83,28 @@ EOF
 
 usage_engine() {
   local engine="$1"
+  if [[ "$engine" == "sd" ]]; then
+    cat <<EOF
+用法: colab.sh sd <动作> [提示词...]
+
+  Colab terminal(tmux) 环境内: stable-diffusion.cpp 服务管理(透传 sd/launch.sh)
+
+动作:
+  start     启动 sd-server(后台, setsid 托管; 首次自动下载模型)
+  stop      停止服务
+  restart   重启服务
+  status    查看状态 + 健康检查
+  test      调用服务生成一张测试图(需服务已就绪)
+  generate [提示词...]  用 sd-cli 一次性出图(不依赖服务; 提示词省略时用 SD_PROMPT)
+  logs      跟踪日志
+  keep      守护模式(崩溃自动拉起)
+  help      显示本帮助
+
+注: sd 引擎无 bench(图片生成不适用 chat 并发压测)。
+日志: 根目录 logs/sd_server.log; 启动命令追加于 logs/launch_cmd.log
+EOF
+    return 0
+  fi
   cat <<EOF
 用法: colab.sh ${engine} <动作>
 
@@ -155,7 +179,7 @@ usage_setup() {
   relaydrop   安装 relaydrop (curl fx4.cn/relaydrop | bash)
   opencode    安装 opencode (curl opencode.ai/install | bash)
   codebuddy   npm 全局安装 @tencent-ai/codebuddy-code(已装则跳过)
-  hint        打印后续步骤提示(source ~/.bashrc / direnv allow / bore start)
+  hint        打印后续步骤提示(source ~/.bashrc / direnv allow 根目录与各引擎目录 / bore start)
   all         依次执行 deps -> bore -> relaydrop -> opencode -> codebuddy -> hint
 
 选项:
@@ -174,14 +198,17 @@ usage_install() {
               --build / -B: 编译源码(支持 Qwen3.8-Flash-Next 的 PR #27742)
     sglang    建 venv + 装 SGLang(不自动启动, 启动请另跑 sglang/launch.sh)
     vllm      建 venv + 装官方最新 vLLM(不自动启动, 启动请另跑 vllm/launch.sh)
+    sd        安装 stable-diffusion.cpp(sd-cli / sd-server)
+              默认: 下载 GitHub Release 官方 Linux 通用预编译二进制(CPU, 解压到 <SD_DIR>/build/bin)
+              --build / -B: 源码编译(GPU CUDA 必须用此选项)
 
 选项:
-  --build, -B   llama 使用源码编译方式(默认下载 GitHub 最新 prerelease 通用预编译二进制; GPU CUDA 请用此选项)
+  --build, -B   llama/sd 使用源码编译方式(默认下载 GitHub Release 通用预编译二进制; 二者 GPU CUDA 请用此选项)
   -h, --help    显示本帮助
 
 平台:
   按是否探测到 NVIDIA GPU 自动选择依赖: GPU 装 CUDA 版 torch, CPU 装 CPU 版 torch;
-  llama --build 在有显卡时编 CUDA 版, 无显卡时编纯 CPU 版。
+  llama --build / sd --build 在有显卡时编 CUDA 版, 无显卡时编纯 CPU 版。
   显卡存在但仍想按 CPU 装: GPU_PROFILE=cpu colab.sh install <engine>
 EOF
 }
@@ -362,7 +389,11 @@ setup_codebuddy() {
 setup_hint() {
   echo ''
   echo 'source ~/.bashrc'
-  echo 'direnv allow .'
+  echo 'direnv allow .            # 根目录 .envrc'
+  echo ''
+  echo '# 各引擎目录的 .envrc 是独立文件, 需进目录各自 allow 一次(否则 direnv 报 blocked):'
+  echo 'cd sd && direnv allow .   # sd 引擎(其余: llama / sglang / vllm 同理)'
+  echo 'cd ..'
   echo ''
   echo './colab.sh bore start   # 公网隧道(setsid 后台托管, 日志 logs/bore.log)'
   echo ''
@@ -394,16 +425,23 @@ do_install() {
         install_llama_prebuilt
       fi
       ;;
+    sd)
+      if [[ "$mode" == "build" ]]; then
+        install_sd_build
+      else
+        install_sd_prebuilt
+      fi
+      ;;
     sglang)
       if [[ "$mode" == "build" ]]; then
-        echo "错误: sglang 不支持 --build(仅 llama 提供源码编译方式)" >&2
+        echo "错误: sglang 不支持 --build(仅 llama/sd 提供源码编译方式)" >&2
         exit 1
       fi
       install_sglang
       ;;
     vllm)
       if [[ "$mode" == "build" ]]; then
-        echo "错误: vllm 不支持 --build(仅 llama 提供源码编译方式)" >&2
+        echo "错误: vllm 不支持 --build(仅 llama/sd 提供源码编译方式)" >&2
         exit 1
       fi
       install_vllm
@@ -414,7 +452,7 @@ do_install() {
       exit 1
       ;;
     *)
-      echo "错误: 未知引擎 '$engine' (可选: llama | sglang | vllm)" >&2
+      echo "错误: 未知引擎 '$engine' (可选: llama | sglang | vllm | sd)" >&2
       usage_install
       exit 1
       ;;
@@ -612,6 +650,189 @@ print(release.get("tag_name", "未知"), asset["browser_download_url"], sep="\t"
 
   echo ""
   echo ">> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/llama/launch.sh"
+}
+
+# ------------------- install sd: stable-diffusion.cpp -----------------------
+# 确保 uv + huggingface_hub/hf_xet(下载模型用); 幂等
+sd_ensure_hf() {
+  echo ">> 检查 uv ..."
+  if ! command -v uv >/dev/null 2>&1; then
+    echo ">> 未检测到 uv, 正在安装..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:${PATH}"
+  fi
+  command -v uv >/dev/null 2>&1 || { echo "ERROR: uv 安装后仍不可用, 请检查 PATH" >&2; exit 1; }
+  echo ">> 安装 huggingface_hub / hf_xet (uv) ..."
+  uv pip install --system --upgrade huggingface_hub hf_xet
+}
+
+# ---------------- install sd: 源码编译(sd-cli / sd-server) ----------------
+install_sd_build() {
+  # 环境变量继承调用方 shell(外层 direnv hook 已注入); 缺失项走各自兜底
+  local SD_DIR="${SD_DIR:-/content/stable-diffusion.cpp}"
+  local REPO_URL="https://github.com/leejet/stable-diffusion.cpp"
+
+  echo ">> stable-diffusion.cpp 安装目录: $SD_DIR"
+
+  # ---- 平台判定: 无 NVIDIA GPU 时编纯 CPU 版本 ----
+  local cpu_build=0
+  if is_cpu_platform; then
+    cpu_build=1
+    echo ">> 平台: CPU (未探测到 NVIDIA GPU) -> 编译纯 CPU 版本"
+  fi
+
+  # ---- 工具链检查 ----
+  local -a tools=(git cmake gcc g++ make)
+  [[ "$cpu_build" -eq 1 ]] || tools+=(nvcc)
+  for t in "${tools[@]}"; do
+    if ! command -v "$t" >/dev/null 2>&1; then
+      echo "ERROR: 缺少必要工具: $t" >&2
+      exit 1
+    fi
+  done
+
+  sd_ensure_hf
+
+  # ---- 克隆 / 复用仓库(子模块: ggml + webp/webm) ----
+  if [[ ! -d "$SD_DIR/.git" ]]; then
+    echo ">> 克隆 stable-diffusion.cpp ..."
+    git clone "$REPO_URL" "$SD_DIR"
+  else
+    echo ">> 复用已有仓库, 尝试更新 ..."
+    ( cd "$SD_DIR" && git pull --ff-only origin master ) || echo "警告: 更新失败, 使用现有代码" >&2
+  fi
+  cd "$SD_DIR"
+
+  echo ">> 初始化子模块 (ggml / libwebp / libwebm) ..."
+  git submodule update --init --recursive ggml thirdparty/libwebp thirdparty/libwebm
+
+  # ---- 可选的嵌入式 Web UI(需 Node.js + pnpm; 默认关闭) ----
+  local -a extra_cmake=()
+  if [[ "${SD_SERVER_BUILD_FRONTEND:-0}" == "1" ]]; then
+    echo ">> SD_SERVER_BUILD_FRONTEND=1: 初始化前端子模块并构建 Web UI ..."
+    git submodule update --init examples/server/frontend
+    extra_cmake+=(-DSD_SERVER_BUILD_FRONTEND=ON)
+  fi
+
+  # ---- 编译 ----
+  if [[ "${CLEAN:-0}" == "1" && -d build ]]; then
+    echo ">> CLEAN=1: 移除旧的 build/ ..."
+    rm -rf build
+  fi
+
+  if [[ "$cpu_build" -eq 1 ]]; then
+    echo ">> CMake 配置 (CPU) ..."
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "${extra_cmake[@]}"
+  else
+    echo ">> CMake 配置 (CUDA; 架构由 ggml 的 native 自动决定) ..."
+    local -a cuda_args=(-DSD_CUDA=ON)
+    # 可选: 显式指定架构(如 SD_CUDA_ARCH=120); 未设置则交给 ggml native 探测
+    if [[ -n "${SD_CUDA_ARCH:-}" ]]; then
+      echo ">> 显式 CUDA 架构: $SD_CUDA_ARCH"
+      cuda_args+=(-DCMAKE_CUDA_ARCHITECTURES="$SD_CUDA_ARCH")
+    fi
+    cmake -S . -B build "${cuda_args[@]}" -DCMAKE_BUILD_TYPE=Release "${extra_cmake[@]}"
+  fi
+
+  echo ">> 编译 ($(nproc) 线程, 首次 CUDA 编译较慢) ..."
+  cmake --build build -j"$(nproc)"
+
+  local BIN_DIR="$SD_DIR/build/bin"
+  for b in sd-server sd-cli; do
+    if [[ ! -x "$BIN_DIR/$b" ]]; then
+      echo "ERROR: 编译后未找到 $b（预期在 $BIN_DIR）" >&2
+      exit 1
+    fi
+  done
+  echo ">> 完成。二进制目录: $BIN_DIR"
+  ls -lh "$BIN_DIR/sd-server" "$BIN_DIR/sd-cli"
+  "$BIN_DIR/sd-server" --version || true
+
+  echo ""
+  echo ">> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/sd/launch.sh"
+}
+
+# -------- install sd: GitHub Release Linux 通用预编译二进制(CPU) --------
+# 从最新 release 选择 bin-Linux-Ubuntu*-x86_64.zip(排除 vulkan/rocm), 解压到 <SD_DIR>/build/bin
+# (预编译包为纯 CPU 构建: CPU 会话直接可用; GPU 用户请用 --build 编 CUDA 版)
+install_sd_prebuilt() {
+  local SD_DIR="${SD_DIR:-/content/stable-diffusion.cpp}"
+  local BIN_DIR="${SD_DIR}/build/bin"
+  local TMP_ZIP="/tmp/sd_prebuilt.zip"
+  local TMP_DIR="/tmp/sd_prebuilt"
+
+  echo ">> 下载 stable-diffusion.cpp 最新 Release 官方预编译二进制 (Linux x86_64, CPU)"
+  echo ">> 安装目录: $SD_DIR (二进制: $BIN_DIR)"
+
+  sd_ensure_hf
+
+  local releases_json
+  if ! releases_json="$(curl -fsSL --retry 2 --connect-timeout 10 \
+    'https://api.github.com/repos/leejet/stable-diffusion.cpp/releases?per_page=100')"; then
+    echo "ERROR: 无法获取 stable-diffusion.cpp GitHub releases 列表" >&2
+    exit 1
+  fi
+
+  local release_info release_tag asset_url
+  if ! release_info="$(python3 -c '
+import json
+import sys
+
+try:
+    releases = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError) as exc:
+    print(f"无法解析 GitHub releases 响应: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+def is_asset(name):
+    low = name.lower()
+    return ("bin-linux-ubuntu" in low
+            and low.endswith("x86_64.zip")
+            and "vulkan" not in low
+            and "rocm" not in low
+            and "cudart" not in low)
+
+candidates = [r for r in releases if not r.get("draft")]
+candidates.sort(key=lambda r: r.get("published_at") or r.get("created_at") or "", reverse=True)
+for release in candidates:
+    asset = next((a for a in release.get("assets", []) if is_asset(a.get("name", ""))
+                  and a.get("browser_download_url")), None)
+    if asset is not None:
+        print(release.get("tag_name", "未知"), asset["browser_download_url"], sep="\t")
+        sys.exit(0)
+print("未找到 Linux x86_64 预编译资产", file=sys.stderr)
+sys.exit(1)
+' <<<"$releases_json")"; then
+    echo "ERROR: 未找到可用的 Linux x86_64 预编译二进制资产" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r release_tag asset_url <<<"$release_info"
+  echo ">> release: $release_tag"
+  echo ">> 资产: $asset_url"
+
+  curl -fL "$asset_url" -o "$TMP_ZIP" || { echo "ERROR: 下载失败" >&2; exit 1; }
+  rm -rf "$TMP_DIR"
+  mkdir -p "$TMP_DIR"
+  python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+    "$TMP_ZIP" "$TMP_DIR" || { echo "ERROR: 解压失败" >&2; exit 1; }
+
+  local server_bin
+  server_bin=$(find "$TMP_DIR" -type f -name sd-server | head -1 || true)
+  if [[ -z "$server_bin" ]]; then
+    echo "ERROR: 压缩包内未找到 sd-server" >&2
+    rm -rf "$TMP_DIR" "$TMP_ZIP"
+    exit 1
+  fi
+  mkdir -p "$BIN_DIR"
+  cp -a "$(dirname "$server_bin")/." "$BIN_DIR/"
+  rm -rf "$TMP_DIR" "$TMP_ZIP"
+
+  [[ -x "$BIN_DIR/sd-server" ]] || chmod +x "$BIN_DIR/sd-server" "$BIN_DIR/sd-cli" 2>/dev/null || true
+  echo ">> 完成。二进制目录: $BIN_DIR"
+  "$BIN_DIR/sd-server" --version || true
+
+  echo ""
+  echo ">> 安装完成。启动服务请另跑: bash ${SCRIPT_DIR}/sd/launch.sh"
 }
 
 # ----------------------- install sglang: venv + SGLang -----------------------
@@ -941,7 +1162,20 @@ do_engine() {
     start | stop | restart | status | test | logs | keep)
       exec "$script" "$action" "${@:2}"
       ;;
+    generate)
+      # 仅 sd 引擎提供(用 sd-cli 一次性出图); 其余引擎报错更清晰
+      if [[ "$engine" != "sd" ]]; then
+        echo "错误: 仅 sd 引擎支持 generate(当前引擎: ${engine})" >&2
+        usage_engine "$engine"
+        exit 1
+      fi
+      exec "$script" generate "${@:2}"
+      ;;
     bench)
+      if [[ "$engine" == "sd" ]]; then
+        echo "错误: sd 引擎无 bench(图片生成不适用 chat 并发压测); 请用 sd test 或 sd generate" >&2
+        exit 1
+      fi
       # 并发压测: 走根目录 bench.py(--engine 由本函数按引擎注入, 后续参数可覆盖)
       # 鉴权密钥等继承调用方环境(外层 direnv hook 或手动 export)
       # PYTHONDONTWRITEBYTECODE: 一次性脚本无需字节码缓存, 避免项目里留下 __pycache__
@@ -951,7 +1185,11 @@ do_engine() {
       exec python3 "${SCRIPT_DIR}/bench.py" --engine "$engine" "$@"
       ;;
     *)
-      echo "错误: 未知动作 '$action' (可选: start | stop | restart | status | test | bench | logs | keep)" >&2
+      if [[ "$engine" == "sd" ]]; then
+        echo "错误: 未知动作 '$action' (可选: start | stop | restart | status | test | generate | logs | keep)" >&2
+      else
+        echo "错误: 未知动作 '$action' (可选: start | stop | restart | status | test | bench | logs | keep)" >&2
+      fi
       usage_engine "$engine"
       exit 1
       ;;
@@ -1099,6 +1337,7 @@ main() {
     llama)   do_engine llama "$@" ;;
     sglang)  do_engine sglang "$@" ;;
     vllm)    do_engine vllm "$@" ;;
+    sd)      do_engine sd "$@" ;;
     bore)    do_bore "$@" ;;
     sync)    do_sync "$@" ;;
     help | -h | --help)
