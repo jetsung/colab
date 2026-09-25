@@ -16,16 +16,20 @@
 #   - 环境变量 HF_TOKEN 已设置（且已在 HF 接受模型许可证）
 #
 # 环境变量(可被外部/命令行覆盖):
-#   LLAMA_MODEL_REPO  模型仓库(不可为空; 未设置时回退 MODEL_REPO)
-#   LLAMA_MODEL_NAME  模型名(未设置时从 REPO 提取: / 后部分去 -GGUF); 服务 --alias 为其小写形式
-#                     未显式设置时, 别名改用"仓库文件清单推导出的真实前缀"(见下方自适应说明)
-#   LLAMA_QUANT       量化档(不可为空, 无默认; 由 .envrc / profile 提供)
+#   LLAMA_MODEL_REPO  模型来源(不可为空; 未设置时回退 MODEL_REPO), 支持四种写法:
+#     本地路径   /abs/model.gguf 或 ./model.gguf — 直接使用, 不下载
+#     file://    file:///abs/model.gguf(绝对) 或 file://rel/model.gguf(相对当前目录)
+#     hf://      hf://<org>/<repo>/<file> 指向具体文件(直接用该文件, 跳过量化档选择)
+#                或 hf://<org>/<repo> 裸仓库(按 LLAMA_QUANT 自适应选择)
+#     HF https   https://huggingface.co/<org>/<repo>/(blob|resolve)/<rev>/<file>
+#                HF 来源下载到标准缓存 ~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/
+#                并定位真实文件路径; 缓存已存在则不联网
+#   LLAMA_MODEL_NAME  模型名(未设置时从文件名/仓库推导); 服务 --alias 为其小写形式
+#   LLAMA_QUANT       量化档(裸仓库来源时不可为空, 无默认; 由 .envrc / profile 提供;
+#                     指向具体文件或本地文件时忽略)
 #   LLAMA_NGL         GPU 卸载层数(默认 999=全部; .env.cpu 为 0=纯 CPU 推理)
 #   LLAMA_CTX         上下文长度(默认 0=由 llama.cpp 按空闲显存拟合; .env.cpu 为 8192)
 #   LLAMA_THREADS     CPU 推理线程数(默认 0=由 llama.cpp 按核心数自行决定, 即不传 -t)
-#   LLAMA_MODEL_ROOT  模型基础盘前缀(未设置回退 MODEL_ROOT, 再兜底 /content/models; 换持久化盘只改这一层)
-#                     不支持 Google Drive(/content/drive): 指向 Drive 的路径会在启动时报错
-#   LLAMA_MODEL_DIR   本仓库模型目录(默认 <ROOT>/<repo名>, 按仓库隔离; 显式设置时原样使用)
 #   LLAMA_DIR       安装目录(默认 /content/llama.cpp; 由 .envrc 导出, 可覆盖)
 #   LLAMA_SERVER     llama 二进制路径(默认从 PATH 查找 command -v llama; 未命中回退 <LLAMA_DIR>/build/bin)
 #   LLAMA_HOST / LLAMA_PORT   监听地址与端口(内部变量 HOST/PORT, 默认 0.0.0.0 / 30000)
@@ -33,11 +37,12 @@
 #   LLAMA_XET         1=启用 HF Xet 存储(默认), 0=禁用
 #   LLAMA_METRICS     1=开放 /metrics 端点(默认, 供根目录 bench.py 采样并发), 0=禁用
 #   LLAMA_VISION      auto=按模型能力自动检测, 1=强制尝试启用, 0=禁用(默认 0)
-#   LLAMA_MMPROJ      视觉投影器 mmproj 路径(可选; 缺省自动检测模型目录 mmproj-*.gguf, 再按需自动下载)
-#   LLAMA_MMPROJ_REPO mmproj 自动下载源(默认同 LLAMA_MODEL_REPO; 空=禁用自动下载)
+#   LLAMA_MMPROJ      视觉投影器 mmproj 来源(可选; 与 LLAMA_MODEL_REPO 同样的四种写法;
+#                     缺省自动检测模型缓存目录 mmproj-*.gguf, 再按需自动下载)
+#   LLAMA_MMPROJ_REPO mmproj 自动下载源仓库(默认同模型仓库; 空=禁用自动下载)
 #
-# 自适应解析(不写死任何路径形式):
-#   先扫描 LLAMA_MODEL_DIR(深度 2), 本地分片齐全则直接启动; 否则拉取仓库文件清单,
+# 裸仓库的自适应解析(不写死任何路径形式):
+#   先扫描 HF 缓存快照目录, 本地分片齐全则直接启动; 否则拉取仓库文件清单,
 #   按 LLAMA_QUANT 自动推导真实布局并下载。已验证的两种典型布局:
 #     unsloth/Qwen3.8-Flash-Next-GGUF  -> UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 #     unsloth/Qwen3.8-27B-GGUF         -> Qwen3.8-27B-UD-Q4_K_XL.gguf  (根目录单文件)
@@ -117,55 +122,23 @@ esac
 # 硬约束: LLAMA_MODEL_REPO / LLAMA_QUANT / LLAMA_MODEL_NAME 不可为空(在 do_start 内校验)
 
 readonly LLAMA_MODEL_REPO="${LLAMA_MODEL_REPO:-${MODEL_REPO:-}}"
-# 仓库名 = LLAMA_MODEL_REPO 取 / 后部分(保留 -GGUF 后缀), 供目录与模型名前缀复用
-#   例: unsloth/Qwen3.8-Flash-Next-GGUF -> Qwen3.8-Flash-Next-GGUF
-readonly LLAMA_REPO_NAME="${LLAMA_MODEL_REPO##*/}"
-# 模型名前缀(用于本地分片文件匹配)
-# 未显式设置时, 从仓库名去除末尾 -GGUF 后缀
-#   例: Qwen3.8-Flash-Next-GGUF -> Qwen3.8-Flash-Next
+# 模型名前缀(用于本地分片文件匹配与 --alias 兜底):
+# 未显式设置时, 从仓库值取末段并去除 -GGUF 后缀(指向具体文件时由文件名推导覆盖)
+#   例: unsloth/Qwen3.8-Flash-Next-GGUF -> Qwen3.8-Flash-Next
 if [[ -z "${LLAMA_MODEL_NAME:-}" ]]; then
-  LLAMA_MODEL_NAME="${LLAMA_REPO_NAME%-GGUF}"   # 去除末尾 -GGUF 后缀
-  readonly LLAMA_MODEL_NAME_EXPLICIT=0          # 未显式设置: 别名以清单推导结果为准
+  LLAMA_MODEL_NAME="${LLAMA_MODEL_REPO##*/}"    # 取 / 后部分
+  LLAMA_MODEL_NAME="${LLAMA_MODEL_NAME%-GGUF}"  # 去除末尾 -GGUF 后缀
+  readonly LLAMA_MODEL_NAME_EXPLICIT=0          # 未显式设置: 别名以解析推导结果为准
 else
   readonly LLAMA_MODEL_NAME_EXPLICIT=1          # 显式设置: 别名与匹配提示均以其为准
 fi
 readonly LLAMA_MODEL_NAME
-# 服务别名: 模型名转小写。未显式设置 LLAMA_MODEL_NAME 时, do_start 内改用清单推导的 PLAN_NAME
-# 例: Qwen3.8-Flash-Next -> qwen3.8-flash-next
+# 服务别名: 模型名转小写。未显式设置 LLAMA_MODEL_NAME 时, do_start 内改用解析推导的 PLAN_NAME
 LLAMA_MODEL_ALIAS="${LLAMA_MODEL_NAME,,}"
-# 无默认值: 必须由外部提供(.envrc / gpu profile / 命令行); 此处仅声明空以规避 set -u
+# 无默认值: 裸仓库来源时必须由外部提供(.envrc / gpu profile / 命令行); 此处仅声明空以规避 set -u
 readonly LLAMA_QUANT="${LLAMA_QUANT:-}"
-# 模型路径(两级: 基础盘前缀 + 本仓库目录)
-#   LLAMA_MODEL_ROOT  基础盘前缀(三级优先级, 见下方解析; 换持久化盘只改这一层)
-#   LLAMA_MODEL_DIR   本仓库模型目录(默认 <ROOT>/<repo名>, 仓库名保留 -GGUF 后缀)
-#     显式设置 LLAMA_MODEL_DIR 时原样使用, 不再拼接 ROOT(保留"自定义任意目录"的自由度)
-#   按仓库分目录是刻意的隔离, 不是简单前缀: 脚本会扫描该目录(深度 2)判断分片是否齐全,
-#   若把公共根(如 /content/models)直接当 MODEL_DIR, 其它仓库同量化档的文件会被判为
-#   "本地已齐全"而误加载, mmproj 也可能抓到别模型的投影器。
-#   目录内按仓库真实结构存放:
-#     子目录布局 -> <dir>/<QUANT>/xxx.gguf ; 根目录布局 -> <dir>/xxx.gguf
-#     例: Qwen3.8-Flash-Next-GGUF -> /content/models/Qwen3.8-Flash-Next-GGUF/{UD-Q4_K_XL/...}
-# 基础盘前缀解析(显式逐级判定, 便于看清优先级; 字面量仅作最后兜底):
-#   1) LLAMA_MODEL_ROOT  引擎专属, 优先级最高
-#   2) MODEL_ROOT        两引擎共用(根 .envrc 导出), 换持久化盘改这一处两引擎同时生效
-#   3) /content/models   兜底默认值, 仅在上述两者均未设置(或为空)时使用
-# "已设置" = 变量存在且非空(空串等同未设置, 继续回退); 来源记入 MODEL_ROOT_SOURCE 便于排查
-MODEL_ROOT_SOURCE=""
-if [[ -n "${LLAMA_MODEL_ROOT:-}" ]]; then
-  MODEL_ROOT_SOURCE="LLAMA_MODEL_ROOT"
-elif [[ -n "${MODEL_ROOT:-}" ]]; then
-  LLAMA_MODEL_ROOT="$MODEL_ROOT"
-  MODEL_ROOT_SOURCE="MODEL_ROOT"
-else
-  LLAMA_MODEL_ROOT="/content/models"
-  MODEL_ROOT_SOURCE="默认值(兜底)"
-fi
-readonly LLAMA_MODEL_ROOT MODEL_ROOT_SOURCE
-# 不支持 Google Drive 作为模型目录: Drive 是 FUSE 挂载, mmap 随机读极慢, 且不提供任何
-# 冷存储/复制降级 —— 指向 /content/drive 的路径在启动时直接报错(见 do_start 内校验)。
-LLAMA_MODEL_DIR="${LLAMA_MODEL_DIR:-$LLAMA_MODEL_ROOT/$LLAMA_REPO_NAME}"
-readonly LLAMA_MODEL_DIR
-# 注: HF_ENDPOINT(huggingface_hub 通用变量, 镜像站可用)不在此声明, 避免 readonly 后无法透传
+# 注: HF 来源统一下载到 HF 标准缓存(HF_HUB_CACHE / HF_HOME, 默认 ~/.cache/huggingface/hub),
+#     不再使用本地模型盘; 缓存目录遵循 HF_HUB_CACHE / HF_HOME 环境变量
 # 安装目录(默认 /content/llama.cpp; .envrc 已 export, 此处兜底)
 readonly LLAMA_DIR="${LLAMA_DIR:-/content/llama.cpp}"
 # 统一二进制解析优先级: 显式 LLAMA_SERVER > PATH 查找 command -v llama(新版 llama serve) > 默认 <LLAMA_DIR>/build/bin/llama
@@ -177,6 +150,24 @@ else
   LLAMA_SERVER="$LLAMA_DIR/build/bin/llama"
 fi
 readonly LLAMA_SERVER
+
+# 动态库解析路径(脚本级 export, llama / llama-gguf 及 setsid 子进程均生效):
+#   - 二进制同目录: 官方预编译包把 libllama-*.so / libggml-*.so 放在二进制旁,
+#     但部分构建未写入 RPATH($ORIGIN), 直接运行会报 cannot open shared object file
+#   - /usr/lib64-nvidia: 容器环境中 NVIDIA 驱动库(libcuda.so.1)的挂载位置
+#   已存在于 LD_LIBRARY_PATH 中的目录不重复追加
+_llama_lib_dirs=()
+_llama_bin_dir="$(dirname "$LLAMA_SERVER")"
+[[ -d "$_llama_bin_dir" ]] && _llama_lib_dirs+=("$_llama_bin_dir")
+[[ -d /usr/lib64-nvidia ]] && _llama_lib_dirs+=("/usr/lib64-nvidia")
+if ((${#_llama_lib_dirs[@]})); then
+  _llama_lib_add="$(IFS=:; echo "${_llama_lib_dirs[*]}")"
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *"$_llama_lib_add"*) ;;
+    *) export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$_llama_lib_add" ;;
+  esac
+fi
+unset _llama_bin_dir _llama_lib_add _llama_lib_dirs
 # 监听地址与端口: 内部变量 HOST/PORT, 可用 LLAMA_HOST / LLAMA_PORT 环境变量覆盖
 readonly PORT="${LLAMA_PORT:-30000}"
 readonly HOST="${LLAMA_HOST:-0.0.0.0}"
@@ -194,12 +185,14 @@ readonly LLAMA_METRICS="${LLAMA_METRICS:-1}"
 #   LLAMA_MMPROJ_REPO  自动下载源(默认同 LLAMA_MODEL_REPO; 设为空字符串则禁用自动下载)
 readonly LLAMA_VISION="${LLAMA_VISION:-0}"
 readonly LLAMA_MMPROJ="${LLAMA_MMPROJ:-}"
-readonly LLAMA_MMPROJ_REPO="${LLAMA_MMPROJ_REPO:-${LLAMA_MODEL_REPO:-}}"
+readonly LLAMA_MMPROJ_REPO="${LLAMA_MMPROJ_REPO:-}"
 
-# 模型解析结果(由 resolve_model_file -> plan_model 填充; 此处先声明空值规避 set -u)
-PLAN_NAME=""              # 由真实文件名推导的模型名前缀(用于 --alias)
+# 模型解析结果(由 resolve_model_file 填充; 此处先声明空值规避 set -u)
+PLAN_NAME=""              # 由真实文件名/仓库清单推导的模型名前缀(用于 --alias)
 PLAN_MMPROJ_INCLUDE=""    # 需下载的 mmproj 仓库内相对路径(无则空)
 MODEL_FILE=""             # 首个分片(或单文件)的本地绝对路径
+MAIN_SNAP=""              # 主模型所在的 HF 缓存快照目录(本地文件来源时为空)
+MODEL_SOURCE_REPO=""      # 模型来源的仓库 ID(hf-repo / hf-file 时非空; 本地文件为空)
 
 # 服务托管(与 sglang/launch.sh 一致): setsid 后台 + PID/日志文件
 # 日志统一写到项目根目录的 logs/(无论从根目录还是 llama/ 下执行, 均落同一处)
@@ -257,29 +250,188 @@ EOF
   fi
 }
 
+# --------------------- HF 标准缓存(hub cache)辅助 ----------------------------
+# 缓存根目录(遵循 HF_HUB_CACHE / HF_HOME, 默认 ~/.cache/huggingface/hub)
+hub_root() {
+  printf '%s' "${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+}
+# 仓库的缓存目录: models--<org>--<repo>(仓库路径中的 / 替换为 --)
+hub_model_dir() {
+  printf '%s/models--%s' "$(hub_root)" "${1//\//--}"
+}
+# 当前主快照目录(refs/main 指向的 revision; 仓库从未下载过则为空串)
+hub_snapshot_dir() {
+  local d rev
+  d="$(hub_model_dir "$1")"
+  rev="$(cat "$d/refs/main" 2>/dev/null || true)"
+  [[ -n "$rev" ]] && printf '%s/snapshots/%s' "$d" "$rev"
+  return 0
+}
+# 在仓库缓存 snapshots/ 下定位文件(相对路径可含子目录, 取最新一份); 未找到输出空
+cache_find_file() {
+  local found=""
+  found="$(find -L "$1/snapshots" -type f -path "*/$2" -printf '%T@ %p\n' 2>/dev/null \
+    | sort -n | tail -1 | cut -d' ' -f2-)"
+  [[ -n "$found" && -f "$found" ]] && printf '%s' "$found"
+  return 0
+}
+# hf download 到标准缓存(不带 --local-dir); 成功时全局 DL_PATH 为下载文件路径(解析失败为空)
+DL_PATH=""
+hf_download() {
+  local url="$1" out
+  DL_PATH=""
+  if ! command -v hf >/dev/null 2>&1; then
+    echo "ERROR: 未找到 hf 命令(用于下载模型)。请先执行: ./colab.sh install llama" >&2
+    return 1
+  fi
+  echo ">> 下载 $url" >&2
+  if [[ "$LLAMA_XET" == "1" ]]; then
+    out="$(HF_HUB_ENABLE_XET=1 HF_TOKEN="${HF_TOKEN:-}" hf download "$url")" || {
+      echo "ERROR: hf download 失败: $url" >&2
+      return 1
+    }
+  else
+    out="$(HF_TOKEN="${HF_TOKEN:-}" hf download "$url")" || {
+      echo "ERROR: hf download 失败: $url" >&2
+      return 1
+    }
+  fi
+  # stdout 末行为下载文件路径(新版格式 "  path: <路径>", 旧版为裸路径)
+  out="${out##*$'\n'}"
+  out="${out##*'path: '}"
+  [[ -n "$out" && -f "$out" ]] && DL_PATH="$out"
+  return 0
+}
+
+# 归类模型来源字符串, stdout: <类别>|<值>
+#   file|<path>                  本地文件(相对路径按当前目录展开), 直接使用
+#   hf-file|<org>/<repo>|<file>  仓库内具体文件(可含子目录)
+#   hf-repo|<org>/<repo>         裸仓库(按 LLAMA_QUANT 自适应选择)
+classify_model_source() {
+  local val="$1" rest org repo seg3
+  case "$val" in
+    file://*)
+      printf 'file|%s' "${val#file://}"
+      return 0
+      ;;
+    ./*|../*)
+      printf 'file|%s' "$val"
+      return 0
+      ;;
+    hf://*)
+      rest="${val#hf://}"
+      if [[ "$rest" == */*/* ]]; then
+        org="${rest%%/*}"; rest="${rest#*/}"
+        repo="${rest%%/*}"; rest="${rest#*/}"
+        printf 'hf-file|%s/%s|%s' "$org" "$repo" "$rest"
+      else
+        printf 'hf-repo|%s' "$rest"
+      fi
+      return 0
+      ;;
+    https://huggingface.co/*)
+      rest="${val#https://huggingface.co/}"
+      org="${rest%%/*}"; rest="${rest#*/}"
+      repo="${rest%%/*}"; rest="${rest#*/}"
+      seg3="${rest%%/*}"
+      if [[ "$seg3" == "blob" || "$seg3" == "resolve" ]]; then
+        rest="${rest#*/}"; rest="${rest#*/}"   # 跳过 blob|resolve 与 revision
+        if [[ -z "$rest" ]]; then
+          echo "ERROR: HF URL 缺少文件路径: $val" >&2
+          return 1
+        fi
+        printf 'hf-file|%s/%s|%s' "$org" "$repo" "$rest"
+      elif [[ "$rest" == */* ]]; then
+        echo "ERROR: 不支持的 HF URL(仅支持文件直链 /blob/ /resolve/ 或仓库主页): $val" >&2
+        return 1
+      else
+        printf 'hf-repo|%s/%s' "$org" "$repo"
+      fi
+      return 0
+      ;;
+    https://*|http://*|ftp://*|s3://*)
+      echo "ERROR: 不支持的来源协议: $val (仅支持 https://huggingface.co/ 与 hf://)" >&2
+      return 1
+      ;;
+    /*)
+      printf 'file|%s' "$val"
+      return 0
+      ;;
+    *)
+      if [[ "$val" == */*/* ]]; then
+        echo "ERROR: 无法识别的模型来源: $val (本地路径请以 / 或 file:// 开头; HF 请用 hf://<org>/<repo>[/<file>])" >&2
+        return 1
+      elif [[ "$val" == */* ]]; then
+        printf 'hf-repo|%s' "$val"    # 裸仓库 ID(org/repo)
+      else
+        printf 'file|%s' "$val"       # 无斜杠: 当前目录下的本地文件
+      fi
+      return 0
+      ;;
+  esac
+}
+
+# 解析 hf-file 来源并定位/下载文件, stdout: 本地路径(缓存命中则不联网)
+resolve_hf_file() {
+  local repo="$1" file="$2" found
+  found="$(cache_find_file "$(hub_model_dir "$repo")" "$file")"
+  if [[ -n "$found" ]]; then
+    echo ">> 缓存已存在: $found" >&2
+    printf '%s' "$found"
+    return 0
+  fi
+  hf_download "hf://${repo}/${file}" || return 1
+  if [[ -n "$DL_PATH" ]]; then
+    printf '%s' "$DL_PATH"
+    return 0
+  fi
+  found="$(cache_find_file "$(hub_model_dir "$repo")" "$file")"
+  if [[ -n "$found" ]]; then
+    printf '%s' "$found"
+    return 0
+  fi
+  echo "ERROR: 下载完成但未定位到文件: $file (缓存目录: $(hub_model_dir "$repo"))" >&2
+  return 1
+}
+
+# 从模型文件名推导名称前缀(用于 --alias): 去扩展名 / 分片序号 / 量化档后缀
+derive_model_name() {
+  local n
+  n="$(basename "$1")"
+  n="${n%.gguf}"
+  n="${n%-?????-of-?????}"     # 去分片序号 -00001-of-00004
+  if [[ -n "$LLAMA_QUANT" && "$n" == *-"$LLAMA_QUANT" ]]; then
+    n="${n%-"$LLAMA_QUANT"}"
+  fi
+  printf '%s' "$n"
+}
+
 # 自适应解析模型布局: 不写死路径形式。
-# 先扫描 LLAMA_MODEL_DIR(深度 2)判断本地分片是否齐全; 不齐全才联网拉仓库文件清单,
+# 先扫描 HF 缓存快照目录(深度 2)判断本地分片是否齐全; 不齐全才联网拉仓库文件清单,
 # 按 LLAMA_QUANT 推导布局(<QUANT>/ 子目录 | 根目录; 单文件 | 分片)并给出下载清单。
 # 输出 KEY=value(值经 shlex 转义, 供 eval):
 #   PLAN_ACTION         local=本地已齐全, download=需下载
-#   PLAN_MODEL_FILE     首个分片(或单文件)的本地绝对路径
+#   PLAN_MODEL_REL      首个分片(或单文件)相对快照目录的路径
 #   PLAN_DIR / PLAN_NAME / PLAN_TOTAL / PLAN_HAVE / PLAN_INCLUDE / PLAN_MMPROJ_INCLUDE
-plan_model() {
-  REPO="$LLAMA_MODEL_REPO" QUANT="$LLAMA_QUANT" MODEL_DIR="$LLAMA_MODEL_DIR" \
-  NAME_HINT="$LLAMA_MODEL_NAME" VISION="$LLAMA_VISION" MMPROJ_REPO="$LLAMA_MMPROJ_REPO" \
+#   PLAN_ACTION         local=本地已齐全, download=需下载
+#   PLAN_MODEL_REL      首个分片(或单文件)相对快照目录的路径
+#   PLAN_DIR / PLAN_NAME / PLAN_TOTAL / PLAN_HAVE / PLAN_INCLUDE / PLAN_MMPROJ_INCLUDE
+plan_model_scan() {
+  REPO="$1" QUANT="$LLAMA_QUANT" SCAN_ROOT="$3" \
+  NAME_HINT="$LLAMA_MODEL_NAME" VISION="$LLAMA_VISION" MMPROJ_REPO="$2" \
   HF_TOKEN="${HF_TOKEN:-}" HF_ENDPOINT="${HF_ENDPOINT:-}" \
   python3 - <<'PY'
 import json, os, re, shlex, sys, urllib.error, urllib.request
 
 REPO        = os.environ.get("REPO", "")
 QUANT       = os.environ.get("QUANT", "")
-MODEL_DIR   = os.environ.get("MODEL_DIR", "")
+SCAN_ROOT   = os.environ.get("SCAN_ROOT", "")   # HF 缓存快照目录(扫描根)
 NAME_HINT   = os.environ.get("NAME_HINT", "")
 VISION      = os.environ.get("VISION", "0")
 MMPROJ_REPO = os.environ.get("MMPROJ_REPO", "")
 TOKEN       = os.environ.get("HF_TOKEN", "")
 ENDPOINT    = os.environ.get("HF_ENDPOINT", "").rstrip("/") or "https://huggingface.co"
-MAX_DEPTH   = 2      # 本地扫描深度: 覆盖 <dir>/<file> 与根目录两种布局
+MAX_DEPTH   = 2      # 本地扫描深度: 覆盖 <snap>/<file> 与 <snap>/<QUANT>/<file> 两种布局
 AUX_DIRS    = {"MTP"}
 
 def emit(k, v):
@@ -413,10 +565,7 @@ def suggest_quants(rels):
         out.add(re.sub(r"-\d+-of-\d+$", "", name))
     return sorted(x for x in out if x)
 
-def abs_path(rel):
-    return os.path.normpath(os.path.join(MODEL_DIR, *rel.split("/")))
-
-local_rels = scan_local(MODEL_DIR)
+local_rels = scan_local(SCAN_ROOT)
 chosen = pick(group(local_rels))
 local_ok = bool(chosen) and complete(chosen)
 
@@ -444,7 +593,7 @@ emit("PLAN_DIR", chosen["dir"])
 emit("PLAN_NAME", chosen["prefix"])
 emit("PLAN_TOTAL", chosen["total"])
 emit("PLAN_HAVE", have)
-emit("PLAN_MODEL_FILE", abs_path(chosen["files"][1]))
+emit("PLAN_MODEL_REL", chosen["files"][1])   # 快照内相对路径(下载后 refs/main 可能更新, 由 bash 重新定位)
 # mmproj: 仅当与主模型同仓库时才能用清单给出精确路径(跨仓库由 bash 侧回退 glob 下载)
 mm_inc = ""
 if not pick_mmproj(local_rels) and VISION != "0" and MMPROJ_REPO \
@@ -454,50 +603,93 @@ emit("PLAN_MMPROJ_INCLUDE", mm_inc)
 PY
 }
 
-# 解析并(按需)下载模型, 结果写入全局: MODEL_FILE + PLAN_*(见 plan_model 注释)
+# 解析并(按需)下载模型, 结果写入全局: MODEL_FILE / PLAN_NAME / MAIN_SNAP / MODEL_SOURCE_REPO
 resolve_model_file() {
-  mkdir -p "$LLAMA_MODEL_DIR"
-  local plan
-  if ! plan="$(plan_model)"; then
+  local cls val
+  cls="$(classify_model_source "$LLAMA_MODEL_REPO")" || exit 1
+  val="${cls#*|}"; cls="${cls%%|*}"
+
+  case "$cls" in
+    file)
+      if [[ ! -f "$val" ]]; then
+        echo "ERROR: LLAMA_MODEL_REPO 指向的文件不存在: $val" >&2
+        exit 1
+      fi
+      MODEL_FILE="$val"
+      PLAN_NAME="$(derive_model_name "$val")"
+      MAIN_SNAP=""
+      MODEL_SOURCE_REPO=""
+      echo ">> 使用本地模型文件: $MODEL_FILE" >&2
+      ;;
+    hf-file)
+      local repo="${val%%|*}" file="${val#*|}" p
+      MODEL_SOURCE_REPO="$repo"
+      p="$(resolve_hf_file "$repo" "$file")" || exit 1
+      MODEL_FILE="$p"
+      PLAN_NAME="$(derive_model_name "$MODEL_FILE")"
+      MAIN_SNAP="$(hub_snapshot_dir "$repo")"
+      ;;
+    hf-repo)
+      resolve_repo_model "$val" || exit 1
+      ;;
+  esac
+}
+
+# 裸仓库来源: 自适应解析布局并(按需)下载, 写入 MODEL_FILE / PLAN_NAME / MAIN_SNAP / MODEL_SOURCE_REPO
+resolve_repo_model() {
+  local repo="$1" mdir snap plan fb_repo
+  mdir="$(hub_model_dir "$repo")"
+  MODEL_SOURCE_REPO="$repo"
+  fb_repo="${LLAMA_MMPROJ_REPO:-$repo}"
+  [[ -n "$LLAMA_QUANT" ]] || {
+    echo "ERROR: LLAMA_QUANT 不可为空。请显式设置(如 LLAMA_QUANT=UD-Q4_K_XL, 或由 gpu profile/.envrc 提供; 或改用指向具体文件的来源如 hf://<org>/<repo>/<file>)。" >&2
+    return 1
+  }
+  snap="$(hub_snapshot_dir "$repo")"
+  if ! plan="$(plan_model_scan "$repo" "$fb_repo" "$snap")"; then
     echo "ERROR: 模型解析失败(见上方输出)。" >&2
-    exit 1
+    return 1
   fi
   eval "$plan"   # shellcheck disable=SC2091  # 值由 python shlex 转义
 
   local layout="${PLAN_DIR:-<仓库根目录>}"
   if [[ "$PLAN_ACTION" == "download" ]]; then
     echo ">> 仓库布局: $layout (${PLAN_NAME}-${LLAMA_QUANT}, ${PLAN_TOTAL} 分片)" >&2
-    echo ">> 本地分片 ${PLAN_HAVE}/${PLAN_TOTAL}, 开始下载 $LLAMA_MODEL_REPO ..." >&2
+    echo ">> 本地分片 ${PLAN_HAVE}/${PLAN_TOTAL}, 开始下载 $repo (缓存: $mdir) ..." >&2
     echo "   (该仓库使用 Xet 存储，需要 hf_xet；install.sh 已安装)" >&2
-    local -a includes=()
-    local line
-    while IFS= read -r line; do
-      [[ -n "$line" ]] && includes+=("$line")
-    done <<<"$PLAN_INCLUDE"
-    # VISION=1: 跳过能力检测, mmproj 与主模型一并下载(同仓库同 local-dir, 无额外请求)
-    if [[ "$LLAMA_VISION" == "1" && -n "$PLAN_MMPROJ_INCLUDE" ]]; then
-      includes+=("$PLAN_MMPROJ_INCLUDE")
-    fi
-    local -a dl=(hf download "$LLAMA_MODEL_REPO" --local-dir "$LLAMA_MODEL_DIR")
+    local -a dl=(hf download "$repo")
     local inc
-    for inc in "${includes[@]}"; do
-      dl+=(--include "$inc")
-    done
-    echo ">> 下载 ${#includes[@]} 个文件 -> $LLAMA_MODEL_DIR" >&2
+    while IFS= read -r inc; do
+      [[ -n "$inc" ]] && dl+=(--include "$inc")
+    done <<<"$PLAN_INCLUDE"
+    if [[ "$LLAMA_VISION" == "1" && -n "$PLAN_MMPROJ_INCLUDE" ]]; then
+      dl+=(--include "$PLAN_MMPROJ_INCLUDE")
+    fi
+    echo ">> 下载 $(( ${#dl[@]} - 1 )) 个 include 项 -> HF 标准缓存" >&2
     if [[ "$LLAMA_XET" == "1" ]]; then
-      HF_HUB_ENABLE_XET=1 HF_TOKEN="$HF_TOKEN" "${dl[@]}"
+      HF_HUB_ENABLE_XET=1 HF_TOKEN="${HF_TOKEN:-}" "${dl[@]}" >&2
     else
-      HF_TOKEN="$HF_TOKEN" "${dl[@]}"
+      HF_TOKEN="${HF_TOKEN:-}" "${dl[@]}" >&2
     fi
   else
     echo ">> 本地模型已齐全 (${PLAN_HAVE}/${PLAN_TOTAL} 分片, 布局: $layout), 跳过下载。" >&2
   fi
 
-  MODEL_FILE="$PLAN_MODEL_FILE"
-  if [[ -z "$MODEL_FILE" || ! -f "$MODEL_FILE" ]]; then
-    echo "ERROR: 未找到模型文件: ${MODEL_FILE:-(未推导)}。下载可能失败, 请查看日志。" >&2
-    exit 1
+  # 定位首个分片(下载可能更新 refs/main, 重新读取快照)
+  snap="$(hub_snapshot_dir "$repo")"
+  if [[ -n "$snap" ]]; then
+    MODEL_FILE="$snap/${PLAN_MODEL_REL}"
+  else
+    MODEL_FILE=""
   fi
+  if [[ -z "$MODEL_FILE" || ! -f "$MODEL_FILE" ]]; then
+    MODEL_FILE="$(cache_find_file "$mdir" "$PLAN_MODEL_REL")"
+  fi
+  if [[ -z "$MODEL_FILE" || ! -f "$MODEL_FILE" ]]; then
+    echo "ERROR: 未找到模型文件: ${PLAN_MODEL_REL}(缓存目录: $mdir)。下载可能失败, 请查看日志。" >&2
+    return 1
+  fi
+  MAIN_SNAP="$snap"
 }
 
 # 判断主模型 GGUF 是否声明多模态支持(存在图像 token / 视觉相关元数据键)。
@@ -524,13 +716,13 @@ model_supports_vision() {
   return 1
 }
 
-# 定位多模态视觉投影器(mmproj)。优先级: 显式 LLAMA_MMPROJ > 本地自动检测(深度 2)
-#   > 按仓库清单推导的精确路径下载(同仓库) / glob 下载(跨仓库)。
+# 定位多模态视觉投影器(mmproj)。优先级: 显式 LLAMA_MMPROJ(四种来源写法)
+#   > 模型所在目录/快照自动检测 > 按仓库清单推导的精确路径下载(同仓库) / glob 下载(跨仓库)。
 # LLAMA_VISION=auto 时仅在主模型声明支持视觉时启用(见 model_supports_vision),
 # 避免把不相干的 mmproj 传给纯文本模型导致启动/请求失败。
 # LLAMA_VISION=1 跳过能力检测并尝试启用; LLAMA_VISION=0 直接禁用 mmproj。
 # 未找到时输出空字符串(不报错): 文本服务照常可用, 仅图片/视频输入不可用。
-# 仅当显式指定的 LLAMA_MMPROJ 路径不存在时返回非零(启动失败; LLAMA_VISION=0 除外)。
+# 仅当显式指定的 LLAMA_MMPROJ 无法解析/下载时返回非零(启动失败; LLAMA_VISION=0 除外)。
 resolve_mmproj_file() {
   local model_file="$1"
 
@@ -550,56 +742,86 @@ resolve_mmproj_file() {
       ;;
   esac
 
-  # 1) 显式指定
+  # 1) 显式指定(本地路径 / file:// / hf:// / HF https URL)
   if [[ -n "$LLAMA_MMPROJ" ]]; then
-    if [[ ! -f "$LLAMA_MMPROJ" ]]; then
-      echo "ERROR: 指定的 LLAMA_MMPROJ 不存在: $LLAMA_MMPROJ" >&2
-      return 1
-    fi
-    printf '%s' "$LLAMA_MMPROJ"
-    return 0
+    local cls val repo file p
+    cls="$(classify_model_source "$LLAMA_MMPROJ")" || return 1
+    val="${cls#*|}"; cls="${cls%%|*}"
+    case "$cls" in
+      file)
+        if [[ ! -f "$val" ]]; then
+          echo "ERROR: 指定的 LLAMA_MMPROJ 不存在: $val" >&2
+          return 1
+        fi
+        printf '%s' "$val"
+        return 0
+        ;;
+      hf-file)
+        repo="${val%%|*}"; file="${val#*|}"
+        p="$(resolve_hf_file "$repo" "$file")" || return 1
+        printf '%s' "$p"
+        return 0
+        ;;
+      hf-repo)
+        echo "ERROR: LLAMA_MMPROJ 需指向具体文件(如 hf://<org>/<repo>/mmproj-F16.gguf), 而非仓库: $LLAMA_MMPROJ" >&2
+        return 1
+        ;;
+    esac
   fi
 
   local mm=""
-  # 2) 模型根目录自动检测(深度 2: 覆盖根目录布局与 <QUANT>/ 子目录布局)
-  mm=$(find "$LLAMA_MODEL_DIR" -maxdepth 2 -type f -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)
+  local fb_repo="${LLAMA_MMPROJ_REPO:-$MODEL_SOURCE_REPO}"
+  # 2) 模型所在目录/快照自动检测(覆盖根目录布局与 <QUANT>/ 子目录布局)
+  if [[ -n "$MAIN_SNAP" && -d "$MAIN_SNAP" ]]; then
+    mm="$(find -L "$MAIN_SNAP" -maxdepth 3 -type f -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)"
+  fi
+  if [[ -z "$mm" ]]; then
+    mm="$(find -L "$(dirname "$model_file")" -maxdepth 2 -type f -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)"
+  fi
   if [[ -n "$mm" ]]; then
     printf '%s' "$mm"
     return 0
   fi
 
-  # 3) 按清单推导的精确路径下载(同仓库); 跨仓库时清单不覆盖, 回退 glob 匹配
+  # 3) 自动下载(HF 标准缓存): 同仓库按清单精确路径, 跨仓库 glob mmproj-*.gguf
   #    (失败仅告警, 不中断启动)
   if [[ -n "$PLAN_MMPROJ_INCLUDE" ]]; then
-    echo ">> 未找到本地 mmproj, 下载 $LLAMA_MMPROJ_REPO -> $PLAN_MMPROJ_INCLUDE ..." >&2
+    echo ">> 未找到本地 mmproj, 下载 $MODEL_SOURCE_REPO -> $PLAN_MMPROJ_INCLUDE ..." >&2
     if [[ "$LLAMA_XET" == "1" ]]; then
-      HF_HUB_ENABLE_XET=1 HF_TOKEN="$HF_TOKEN" \
-        hf download "$LLAMA_MMPROJ_REPO" --include "$PLAN_MMPROJ_INCLUDE" --local-dir "$LLAMA_MODEL_DIR" >/dev/null 2>&1 || true
+      HF_HUB_ENABLE_XET=1 HF_TOKEN="${HF_TOKEN:-}" \
+        hf download "$MODEL_SOURCE_REPO" --include "$PLAN_MMPROJ_INCLUDE" >/dev/null 2>&1 || true
     else
-      HF_TOKEN="$HF_TOKEN" \
-        hf download "$LLAMA_MMPROJ_REPO" --include "$PLAN_MMPROJ_INCLUDE" --local-dir "$LLAMA_MODEL_DIR" >/dev/null 2>&1 || true
+      HF_TOKEN="${HF_TOKEN:-}" \
+        hf download "$MODEL_SOURCE_REPO" --include "$PLAN_MMPROJ_INCLUDE" >/dev/null 2>&1 || true
     fi
-  elif [[ -n "$LLAMA_MMPROJ_REPO" ]]; then
-    echo ">> 未找到本地 mmproj, 开始下载 $LLAMA_MMPROJ_REPO (mmproj-*.gguf) ..." >&2
+    mm="$(cache_find_file "$(hub_model_dir "$MODEL_SOURCE_REPO")" "$PLAN_MMPROJ_INCLUDE")"
+    if [[ -n "$mm" ]]; then
+      printf '%s' "$mm"
+      return 0
+    fi
+  elif [[ -n "$fb_repo" ]]; then
+    echo ">> 未找到本地 mmproj, 开始下载 $fb_repo (mmproj-*.gguf) ..." >&2
     if [[ "$LLAMA_XET" == "1" ]]; then
-      HF_HUB_ENABLE_XET=1 HF_TOKEN="$HF_TOKEN" \
-        hf download "$LLAMA_MMPROJ_REPO" --include 'mmproj-*.gguf' --local-dir "$LLAMA_MODEL_DIR" >/dev/null 2>&1 || true
+      HF_HUB_ENABLE_XET=1 HF_TOKEN="${HF_TOKEN:-}" \
+        hf download "$fb_repo" --include 'mmproj-*.gguf' >/dev/null 2>&1 || true
     else
-      HF_TOKEN="$HF_TOKEN" \
-        hf download "$LLAMA_MMPROJ_REPO" --include 'mmproj-*.gguf' --local-dir "$LLAMA_MODEL_DIR" >/dev/null 2>&1 || true
+      HF_TOKEN="${HF_TOKEN:-}" \
+        hf download "$fb_repo" --include 'mmproj-*.gguf' >/dev/null 2>&1 || true
     fi
-    mm=$(find "$LLAMA_MODEL_DIR" -maxdepth 2 -type f -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)
+    local snap
+    snap="$(hub_snapshot_dir "$fb_repo")"
+    if [[ -n "$snap" ]]; then
+      mm="$(find -L "$snap" -maxdepth 3 -type f -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)"
+    fi
+    if [[ -z "$mm" ]]; then
+      mm="$(find -L "$(hub_model_dir "$fb_repo")/snapshots" -type f -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)"
+    fi
     if [[ -n "$mm" ]]; then
       printf '%s' "$mm"
       return 0
     fi
   fi
 
-  mm=$(find "$LLAMA_MODEL_DIR" -maxdepth 2 -type f -name 'mmproj-*.gguf' -print -quit 2>/dev/null || true)
-  if [[ -n "$mm" ]]; then
-    printf '%s' "$mm"
-    return 0
-  fi
   echo "警告: mmproj 下载失败或未找到, 图片输入不可用(文本功能不受影响)。" >&2
   return 0
 }
@@ -616,20 +838,11 @@ do_start() {
 
   # 硬约束: 核心变量不可为空(仅 start 需要, 故在启动时校验)
   if [[ -z "$LLAMA_MODEL_REPO" ]]; then
-    echo "ERROR: LLAMA_MODEL_REPO 不可为空(且 MODEL_REPO 亦未提供)。请设置模型仓库(如 unsloth/Qwen3.8-Flash-Next-GGUF)。" >&2
+    echo "ERROR: LLAMA_MODEL_REPO 不可为空(且 MODEL_REPO 亦未提供)。请设置模型来源(如 unsloth/Qwen3.8-Flash-Next-GGUF 或 hf://<org>/<repo>/<file>)。" >&2
     exit 1
   fi
   if [[ -z "$LLAMA_MODEL_NAME" ]]; then
     echo "ERROR: LLAMA_MODEL_NAME 不可为空(显式设置或从 LLAMA_MODEL_REPO 提取均无效)。" >&2
-    exit 1
-  fi
-  if [[ -z "$LLAMA_QUANT" ]]; then
-    echo "ERROR: LLAMA_QUANT 不可为空。请显式设置(如 LLAMA_QUANT=UD-Q4_K_XL, 或由 gpu profile/.envrc 提供)。" >&2
-    exit 1
-  fi
-  # Google Drive 不支持作为模型目录(含通过 LLAMA_MODEL_ROOT / MODEL_ROOT 间接指向)
-  if [[ "$LLAMA_MODEL_DIR" == /content/drive/* || "$LLAMA_MODEL_DIR" == /content/drive ]]; then
-    echo "ERROR: 不支持 Google Drive 作为模型目录: $LLAMA_MODEL_DIR" >&2
     exit 1
   fi
   case "$LLAMA_VISION" in
@@ -686,7 +899,9 @@ do_start() {
 
   echo "启动 llama 服务... (日志: ${LOG_FILE})" | tee -a "$LOG_FILE"
   echo ">> 加载模型: $MODEL_FILE" | tee -a "$LOG_FILE"
-  echo ">> 模型目录: $LLAMA_MODEL_DIR (基础盘: $LLAMA_MODEL_ROOT, 来源: $MODEL_ROOT_SOURCE)" | tee -a "$LOG_FILE"
+  if [[ -n "$MAIN_SNAP" ]]; then
+    echo ">> 模型缓存快照: $MAIN_SNAP" | tee -a "$LOG_FILE"
+  fi
   if [[ -n "$MMPROJ_FILE" ]]; then
     echo ">> 视觉投影器(mmproj): $MMPROJ_FILE (图片输入已启用)" | tee -a "$LOG_FILE"
   else
@@ -774,11 +989,25 @@ do_test() {
     AUTH=(-H "Authorization: Bearer $LLAMA_API_KEY")
   fi
 
-  echo ">> 发送测试对话 (model=${LLAMA_MODEL_ALIAS}, port=${PORT}) ..."
-  curl -s --max-time 30 "http://localhost:${PORT}/v1/chat/completions" \
+  echo ">> 发送测试对话 (port=${PORT}) ..."
+  # 模型名: 优先查询服务实际加载的模型(与启动时的 --alias 一致)。
+  # do_test 是独立进程, 无 profile/解析上下文, LLAMA_MODEL_ALIAS 回退值可能带量化档后缀
+  # 而与服务器不一致(llama-server 虽宽容处理, 但保持一致更稳)。
+  local model_name="$LLAMA_MODEL_ALIAS"
+  local models_json queried
+  models_json="$(curl -s --max-time 5 "http://localhost:${PORT}/v1/models" "${AUTH[@]}" 2>/dev/null || true)"
+  if [[ -n "$models_json" ]]; then
+    queried="$(python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["data"][0]["id"])' <<<"$models_json" 2>/dev/null || true)"
+    [[ -n "$queried" ]] && model_name="$queried"
+  fi
+
+  # max_tokens 给足余量: 思考型模型(如 Qwen3)会先消耗大量 token 在 reasoning_content 上,
+  # 太小会导致 content 为空(只有思考过程)。超时也相应放宽。
+  echo ">> 测试对话: model=${model_name}"
+  curl -s --max-time 60 "http://localhost:${PORT}/v1/chat/completions" \
     "${AUTH[@]}" \
     -H "Content-Type: application/json" \
-    -d "{\"model\": \"${LLAMA_MODEL_ALIAS}\", \"messages\": [{\"role\": \"user\", \"content\": \"你好, 请用一句话回复\"}], \"max_tokens\": 64}" \
+    -d "{\"model\": \"${model_name}\", \"messages\": [{\"role\": \"user\", \"content\": \"你好, 请用一句话回复\"}], \"max_tokens\": 512}" \
     | python3 -c 'import sys,json; d=json.load(sys.stdin); print("回复:", d["choices"][0]["message"]["content"])' 2>/dev/null \
     || { echo "错误: 请求失败, 请检查服务状态" >&2; exit 1; }
 }

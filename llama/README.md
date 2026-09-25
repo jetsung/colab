@@ -90,13 +90,14 @@ direnv allow .        # 首次进入需允许本目录 .envrc(根目录的 allow
 
 流程：
 
-1. 扫描 `LLAMA_MODEL_DIR`（深度 2），按 `LLAMA_QUANT` 匹配 `*-<QUANT>.gguf` / `*-<QUANT>-<5位序号>-of-<5位总数>.gguf`；
+1. 扫描 HF 缓存快照目录 `~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/`（深度 2），
+   按 `LLAMA_QUANT` 匹配 `*-<QUANT>.gguf` / `*-<QUANT>-<5位序号>-of-<5位总数>.gguf`；
    分片序号 1..N 齐全 → 直接启动，**不联网**。
 2. 不齐全 → 拉取 HF 仓库文件清单（`HF_TOKEN` / `HF_ENDPOINT` 生效），按同一规则归组，推导：
    布局目录、模型名前缀（`--alias`）、分片总数、待下载文件清单、mmproj 路径。
    多个候选时优先级：分片完整 > `<QUANT>/` 子目录 > 根目录 > 其他目录。
-3. 按推导出的**精确文件清单**下载（`hf download --include`，不再用通配符目录），
-   因此不会误下载 `imatrix` / `MTP` / 其他量化档。
+3. 按推导出的**精确文件清单**下载到 HF 标准缓存（`hf download --include`，不再用通配符目录），
+   因此不会误下载 `imatrix` / `MTP` / 其他量化档，再从 `snapshots/` 定位真实文件路径。
 4. `mmproj`：本地已有则直接用；否则按清单精确路径下载（同仓库），跨仓库时回退 `mmproj-*.gguf` 匹配。
 
 量化档不存在时会打印该仓库**可用档位**清单，例如：
@@ -110,6 +111,9 @@ ERROR: 仓库 unsloth/Qwen3.8-27B-GGUF 中未找到量化档 NOPE 的 .gguf 文�
 ```bash
 LLAMA_MODEL_REPO=unsloth/Qwen3.8-27B-GGUF ./launch.sh start   # 27B（根目录单文件布局）
 LLAMA_QUANT=UD-Q2_K_XL ./launch.sh start                      # 换个量化档
+# 指向具体文件(跳过量化档选择) / 本地文件：
+LLAMA_MODEL_REPO=hf://unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf ./launch.sh start
+LLAMA_MODEL_REPO=file:///path/to/model.gguf ./launch.sh start
 ```
 
 服务管理（与 `sglang/launch.sh` 一致）：
@@ -129,11 +133,10 @@ LLAMA_QUANT=UD-Q2_K_XL ./launch.sh start                      # 换个量化档
 
 | 变量 | 默认/回退 | 说明 |
 |------|-----------|------|
-| `LLAMA_MODEL_REPO` | 回退 `MODEL_REPO` | HF 仓库（**不可为空**） |
-| `LLAMA_MODEL_NAME` | 从 REPO 提取（`/` 后去 `-GGUF`） | 模型名（仅作别名与匹配提示；未显式设置时别名改用清单推导结果） |
-| `LLAMA_QUANT` | 无默认（**不可为空**） | 量化档位（由 `.env.g4`/`.env.t4` 或命令行提供） |
-| `LLAMA_MODEL_ROOT` | 回退 `MODEL_ROOT`（根 `.envrc`，默认 `/content/models`，各引擎共用） | 模型基础盘前缀（换持久化盘只改这一层） |
-| `LLAMA_MODEL_DIR` | `<ROOT>/<repo名>` | 本仓库模型目录（显式设置则原样使用，不再拼 ROOT；其下按仓库真实结构存放） |
+| `LLAMA_MODEL_REPO` | 回退 `MODEL_REPO` | 模型来源（**不可为空**）：本地路径 / `file://` / `hf://<org>/<repo>[/<file>]` / HF https URL；裸仓库按 `LLAMA_QUANT` 自适应，指向具体文件或本地文件则直接使用 |
+| `LLAMA_MODEL_NAME` | 从来源提取（`/` 后去 `-GGUF`） | 模型名（仅作别名提示；未显式设置时别名改用文件名/清单推导结果） |
+| `LLAMA_QUANT` | 无默认 | 量化档位（由 `.env.g4`/`.env.t4` 或命令行提供；裸仓库来源时不可为空，指向具体文件/本地文件时忽略） |
+| `HF_HUB_CACHE` / `HF_HOME` | `~/.cache/huggingface/hub` | HF 下载缓存目录（HF 标准布局，非 llama 专属变量） |
 | `HF_ENDPOINT` | `https://huggingface.co` | HF 端点（镜像站可覆盖；文件清单与 `hf download` 均遵循） |
 | `LLAMA_SERVER` | `/content/llama.cpp/build/bin/llama-server` | llama-server 二进制路径 |
 | `LLAMA_HOST` / `LLAMA_PORT` | `0.0.0.0` / `30000` | 监听地址与端口 |
@@ -143,8 +146,8 @@ LLAMA_QUANT=UD-Q2_K_XL ./launch.sh start                      # 换个量化档
 | `LLAMA_XET` | `1` | 1=启用 HF Xet 存储（默认），0=禁用 |
 | `LLAMA_METRICS` | `1` | 1=开放 `/metrics` 端点（默认，供根目录 `bench.py` 采样并发），0=禁用 |
 | `LLAMA_VISION` | `0` | `auto`=按模型能力自动检测，`1`=跳过检测并尝试启用，`0`=完全禁用视觉 |
-| `LLAMA_MMPROJ` | 自动检测 `模型目录/mmproj-*.gguf` | 视觉投影器路径（图片输入）；缺省自动下载 `mmproj-*.gguf` |
-| `LLAMA_MMPROJ_REPO` | 同 `LLAMA_MODEL_REPO` | mmproj 自动下载源；设为空串禁用自动下载 |
+| `LLAMA_MMPROJ` | 自动检测 `模型缓存快照/mmproj-*.gguf` | 视觉投影器来源（图片输入）；支持与 `LLAMA_MODEL_REPO` 相同的四种写法；缺省自动下载 `mmproj-*.gguf` |
+| `LLAMA_MMPROJ_REPO` | 同模型来源的仓库 ID | mmproj 自动下载源仓库；设为空串禁用自动下载 |
 
 > `LLAMA_VISION=auto` 时，mmproj 采用**动态能力检测**：启动前解析主模型 GGUF 元数据，仅当存在
 > `image_token_id`/视觉键（如 qwen4exp 的 `qwen4exp.ple.image_token_id`）时才加载 mmproj；换用纯文本模型时会自动跳过，

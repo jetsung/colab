@@ -95,14 +95,17 @@ ls /content/stable-diffusion.cpp/build/bin/     # sd-cli  sd-server
 | VAE | `--vae` | `unsloth/Qwen-Image-2.1-FP8` | `vae/qwen_image_2.1_vae_bf16.safetensors` |
 | 文本编码器 | `--llm` | `unsloth/Qwen3-VL-8B-Instruct-GGUF` | `Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf` |
 
-`sd/launch.sh` 首次启动时会用 `hf download` 自动下载到本地工作盘（**按仓库分目录隔离**）：
+`sd/launch.sh` 首次启动时会用 `hf download hf://<org>/<repo>/<file>` 自动下载到 **HF 标准缓存**
+（`~/.cache/huggingface/hub`，仓库路径中的 `/` 替换为 `--`），再从 `snapshots/` 下定位真实文件路径：
 
 ```
-/content/models/
-├── Qwen-Image-2.1-GGUF/qwen-image-2.1-Q4_K_M.gguf
-├── Qwen-Image-2.1-FP8/vae/qwen_image_2.1_vae_bf16.safetensors
-└── Qwen3-VL-8B-Instruct-GGUF/Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf
+~/.cache/huggingface/hub/
+├── models--unsloth--Qwen-Image-2.1-GGUF/snapshots/<hash>/qwen-image-2.1-Q4_K_M.gguf
+├── models--unsloth--Qwen-Image-2.1-FP8/snapshots/<hash>/vae/qwen_image_2.1_vae_bf16.safetensors
+└── models--unsloth--Qwen3-VL-8B-Instruct-GGUF/snapshots/<hash>/Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf
 ```
+
+> 缓存目录遵循 `HF_HUB_CACHE` / `HF_HOME`（默认 `~/.cache/huggingface/hub`）。已下载过则直接复用，不联网。
 
 > Qwen-Image-2.1 必须配它自己的 VAE（`qwen_image_2.1_vae_bf16.safetensors`），旧的 Qwen-Image / Wan2.2 VAE **不通用**。
 
@@ -111,9 +114,7 @@ ls /content/stable-diffusion.cpp/build/bin/     # sd-cli  sd-server
 编辑需要视觉投影器。取消 `sd/.env.g4` 中这两行注释，或命令行覆盖：
 
 ```bash
-SD_LLM_VISION_REPO=unsloth/Qwen3-VL-8B-Instruct-GGUF \
-SD_LLM_VISION_FILE=mmproj-F16.gguf \
-./launch.sh start
+SD_LLM_VISION=hf://unsloth/Qwen3-VL-8B-Instruct-GGUF/mmproj-F16.gguf ./launch.sh start
 ```
 
 ### CPU 默认：SD1.5 单文件
@@ -169,13 +170,23 @@ make sd-test
 
 日志统一写在**项目根目录** `logs/sd_server.log`（PID 文件 `sd/sd.pid`，启动命令追加于 `logs/launch_cmd.log`）。
 
-### 组件解析（不写死路径）
+### 组件解析（统一模型来源格式）
 
-每个组件都遵循同一套优先级，缺哪个补哪个：
+每个组件用 `<VAR>` 一个变量表达完整来源，支持四种写法：
 
-1. `<VAR>` 显式本地绝对路径（如 `SD_VAE=/path/to/vae.safetensors`）→ 直接用；
-2. 本地 `<SD_MODEL_ROOT>/<repo名>/<file>` 已存在 → **不联网**；
-3. 否则 `hf download <repo> --include <file> --local-dir <SD_MODEL_ROOT>/<repo名>` 自动下载。
+| 写法 | 示例 | 行为 |
+|------|------|------|
+| 本地路径 | `/path/to/model.gguf`、`./model.gguf` | 直接使用（相对路径按当前目录解析） |
+| `file://` | `file:///abs/model.gguf`、`file://rel/model.gguf` | 已下载到本地的文件，直接使用不下载（三个 `/` 为绝对路径；两个 `/` 后接相对路径，按当前目录展开） |
+| `hf://` | `hf://unsloth/Qwen-Image-2.1-GGUF/qwen-image-2.1-Q4_K_M.gguf` | 等价 `hf download hf://<org>/<repo>/<file>` |
+| HF https URL | `https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF/blob/main/qwen-image-2.1-Q4_K_M.gguf` | 去掉 domain 与 `blob/main`（或 `resolve/<rev>`），归一为 `hf://<org>/<repo>/<file>` 后按上一行下载 |
+
+HF 来源（`hf://` 与 HF https URL）先查 HF 标准缓存
+`~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/`（已存在则不联网），
+未命中则 `hf download hf://<org>/<repo>/<file>` 下载，再从 `snapshots/` 定位真实文件路径。
+
+各 profile（`.env.g4/.env.t4/.env.cpu`）默认值即 `hf://` 形式。也保留旧式
+`<VAR>_REPO` + `<VAR>_FILE` 组合作为回退（`<VAR>` 未设置时生效）。
 
 > `SD_MODEL`（→`-m`）与 `SD_DIFFUSION_MODEL`（→`--diffusion-model`）**至少配置一个**，否则启动报错。
 
@@ -185,13 +196,14 @@ make sd-test
 
 | 变量 | 默认 / 回退 | 说明 |
 |------|-------------|------|
-| `SD_DIFFUSION_MODEL` / `_REPO` / `_FILE` | 见 `.env.g4` | 组件式扩散主干（→ `--diffusion-model`） |
-| `SD_MODEL` / `_REPO` / `_FILE` | `.env.cpu` 用 SD1.5 | 单文件全模型（→ `-m`） |
-| `SD_VAE` / `_REPO` / `_FILE` | `.env.g4` | 独立 VAE（→ `--vae`） |
-| `SD_LLM` / `_REPO` / `_FILE` | `.env.g4` | 文本编码器（→ `--llm`） |
-| `SD_LLM_VISION` / `_REPO` / `_FILE` | 空（关闭） | 视觉投影器（→ `--llm_vision`，图生图/编辑） |
-| `SD_CLIP_L` / `SD_CLIP_G` / `SD_T5XXL` | 空 | SD3/FLUX 的文本编码器（→ `--clip_l/--clip_g/--t5xxl`） |
-| `SD_MODEL_ROOT` | 回退 `MODEL_ROOT`（默认 `/content/models`） | 模型基础盘前缀 |
+| `SD_DIFFUSION_MODEL` | `.env.g4`（`hf://…`） | 组件式扩散主干（→ `--diffusion-model`）；支持本地路径/`file://`/`hf://`/HF https URL |
+| `SD_MODEL` | `.env.cpu` 用 SD1.5 | 单文件全模型（→ `-m`）；同上四种来源写法 |
+| `SD_VAE` | `.env.g4` | 独立 VAE（→ `--vae`）；同上 |
+| `SD_LLM` | `.env.g4` | 文本编码器（→ `--llm`）；同上 |
+| `SD_LLM_VISION` | 空（关闭） | 视觉投影器（→ `--llm_vision`，图生图/编辑）；同上 |
+| `SD_CLIP_L` / `SD_CLIP_G` / `SD_T5XXL` | 空 | SD3/FLUX 的文本编码器（→ `--clip_l/--clip_g/--t5xxl`）；同上 |
+| `<VAR>_REPO` / `<VAR>_FILE` | 空 | 旧式组合写法回退（`<VAR>` 未设置时生效） |
+| `HF_HUB_CACHE` / `HF_HOME` | `~/.cache/huggingface/hub` | HF 下载缓存目录（HF 标准布局，非 SD 专属变量） |
 | `SD_HOST` / `SD_PORT` | `0.0.0.0` / `30000` | 监听地址与端口（与 bore 隧道一致） |
 | `SD_STEPS` | profile 提供 | 采样步数（→ `--steps`） |
 | `SD_CFG_SCALE` | profile 提供 | CFG 强度（→ `--cfg-scale`） |
@@ -308,11 +320,11 @@ colab/
 │   └── sd.pid               # 运行 PID（自动生成）
 └── /content/
     ├── stable-diffusion.cpp/        # 源码与编译产物（build/bin/sd-cli、sd-server）
-    ├── outputs/                     # generate / test 出图目录
-    └── models/                      # 模型工作盘（按 HF 仓库名分目录）
-        ├── Qwen-Image-2.1-GGUF/
-        ├── Qwen-Image-2.1-FP8/
-        └── Qwen3-VL-8B-Instruct-GGUF/
+    └── outputs/                     # generate / test 出图目录
+~/.cache/huggingface/hub/            # 模型 HF 标准缓存（models--<org>--<repo>/snapshots/）
+├── models--unsloth--Qwen-Image-2.1-GGUF/
+├── models--unsloth--Qwen-Image-2.1-FP8/
+└── models--unsloth--Qwen3-VL-8B-Instruct-GGUF/
 ```
 
 参考：

@@ -756,8 +756,13 @@ sd.cpp 的权重支持 GGUF / safetensors / ckpt。加载方式有两种：
 - **单文件全模型**（`-m/--model`）：如 SD1.5/SD3 的 `*.safetensors`，无需额外组件；
 - **组件式**（`--diffusion-model` + `--vae` + `--llm`）：如 FLUX / Qwen-Image，主干、VAE、文本编码器分开。
 
-> 项目脚本已封装修拉流程：`sd/launch.sh start` 会按 `<VAR>_REPO`/`<VAR>_FILE` 用 `hf download`
-> 自动下载到本地工作盘（`/content/models/<仓库名>/`，按仓库分目录隔离），本地已存在则不联网。
+> 项目脚本已封装修拉流程：`sd/launch.sh start` 会按各组件 `<VAR>` 的来源写法用
+> `hf download hf://<org>/<repo>/<file>` 自动下载到 **HF 标准缓存**
+> （`~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/`，仓库路径中的 `/` 替换为 `--`），
+> 并从 `snapshots/` 定位真实文件路径；缓存已存在则不联网。
+> `<VAR>` 支持：本地路径、`file://`（`file:///abs` 绝对、`file://rel` 相对当前目录；已下载到本地时直接用，不下载）、
+> `hf://<org>/<repo>/<file>`、`https://huggingface.co/<org>/<repo>/(blob|resolve)/<rev>/<file>`（归一为 `hf://` 后下载）；
+> 旧式 `<VAR>_REPO`+`<VAR>_FILE` 组合仍作为回退生效。
 
 ### D2.1 默认（G4）：Qwen-Image-2.1 三件套
 
@@ -779,9 +784,8 @@ sd.cpp 的权重支持 GGUF / safetensors / ckpt。加载方式有两种：
 
 ```bash
 uv pip install --system --upgrade huggingface_hub hf_xet
-hf download unsloth/Qwen-Image-2.1-GGUF \
-  --include "qwen-image-2.1-Q4_K_M.gguf" \
-  --local-dir /content/models/Qwen-Image-2.1-GGUF
+hf download hf://unsloth/Qwen-Image-2.1-GGUF/qwen-image-2.1-Q4_K_M.gguf
+# 下载到 ~/.cache/huggingface/hub/models--unsloth--Qwen-Image-2.1-GGUF/snapshots/<hash>/...
 ```
 
 公开仓库无需 token；gated 仓库需 `export HF_TOKEN=hf_xxx` 并接受许可证。
@@ -829,11 +833,13 @@ sd-server \
 
 | sd.cpp 参数 | 环境变量 | 说明 |
 |---|---|---|
-| `--diffusion-model` | `SD_DIFFUSION_MODEL`（或 `_REPO`/`_FILE`） | 组件式扩散主干 |
-| `-m, --model` | `SD_MODEL`（或 `_REPO`/`_FILE`） | 单文件全模型（与上者至少配一个） |
-| `--vae` | `SD_VAE`（或 `_REPO`/`_FILE`） | 独立 VAE |
-| `--llm` | `SD_LLM`（或 `_REPO`/`_FILE`） | 文本编码器（Qwen-Image 用 Qwen3-VL） |
-| `--llm_vision` | `SD_LLM_VISION`（或 `_REPO`/`_FILE`） | 视觉投影器（图生图/编辑，可选） |
+| `--diffusion-model` | `SD_DIFFUSION_MODEL` | 组件式扩散主干 |
+| `-m, --model` | `SD_MODEL` | 单文件全模型（与上者至少配一个） |
+| `--vae` | `SD_VAE` | 独立 VAE |
+| `--llm` | `SD_LLM` | 文本编码器（Qwen-Image 用 Qwen3-VL） |
+| `--llm_vision` | `SD_LLM_VISION` | 视觉投影器（图生图/编辑，可选） |
+
+模型类变量均支持本地路径 / `file://` / `hf://` / HF https URL 四种来源写法（见 D2 节说明）。
 | `--clip_l` / `--clip_g` / `--t5xxl` | `SD_CLIP_L` / `SD_CLIP_G` / `SD_T5XXL` | SD3/FLUX 的文本编码器（可选） |
 | `--steps` | `SD_STEPS` | 采样步数（留空不传，由模型决定） |
 | `--cfg-scale` | `SD_CFG_SCALE` | CFG 强度 |
@@ -849,7 +855,8 @@ sd-server \
 | `-b, --batch-count` | `SD_BATCH_COUNT` | **仅 generate**：一次出图张数（>1 时输出名带 `%02d`） |
 | `-l, --listen-ip` / `--listen-port` | `SD_HOST` / `SD_PORT` | 监听地址与端口（默认 `0.0.0.0:30000`） |
 
-其它：`SD_DIR`（安装目录）、`SD_SERVER`/`SD_CLI`（二进制路径）、`SD_MODEL_ROOT`（模型盘前缀，回退 `MODEL_ROOT`）、
+其它：`SD_DIR`（安装目录）、`SD_SERVER`/`SD_CLI`（二进制路径）、
+`HF_HUB_CACHE`/`HF_HOME`（HF 下载缓存目录，默认 `~/.cache/huggingface/hub`）、
 `SD_OUTPUT_DIR`（出图目录，默认 `/content/outputs`）、`SD_PROMPT`（默认提示词）、
 `SD_REQUEST_TIMEOUT`（test 请求超时秒数，默认 1800）、`SD_XET`（默认 1）。
 `generate` 另会传 `-M img_gen`、`-p <提示词>`、`-o <输出路径>`。
@@ -918,10 +925,11 @@ cd /content/colab
 > 延迟在 FUSE 上会被放大 —— 30GB 的权重可能从数十秒变成十几分钟，表现得像卡死
 > （挂载再抖一下，进程还可能进入 uninterruptible sleep，kill 都杀不掉）。
 
-因此引擎**不支持把 Drive 用作模型目录**：模型目录（含通过 `MODEL_ROOT` / `LLAMA_MODEL_ROOT` /
-`SGLANG_MODEL_ROOT` / `VLLM_MODEL_ROOT` / `SD_MODEL_ROOT` 间接指向）以 `/content/drive` 开头时，
+因此引擎**不支持把 Drive 用作模型目录**：模型目录（含通过 `MODEL_ROOT` /
+`SGLANG_MODEL_ROOT` / `VLLM_MODEL_ROOT` 间接指向）以 `/content/drive` 开头时，
 `launch.sh start` 直接报错退出；脚本也**不会自动复制/降级**任何文件。Drive 只作为冷存储，
-权重的搬运完全由手动 `./colab.sh sync` 完成（见下）。
+权重的搬运完全由手动 `./colab.sh sync` 完成（见下）。llama 与 sd 的 HF 来源权重走 HF 标准
+缓存（`~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/`，本机盘），同样不经 Drive。
 
 ```bash
 # 根 .envrc（各引擎共用）—— 模型一律放本地盘

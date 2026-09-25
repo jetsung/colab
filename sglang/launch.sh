@@ -127,8 +127,8 @@ esac
 # 硬约束: 两者均空时 do_start 报错(参照 llama/launch.sh)
 readonly SGLANG_MODEL_REPO="${SGLANG_MODEL_REPO:-${MODEL_REPO:-}}"
 readonly SGLANG_MODEL_REPO_NAME="${SGLANG_MODEL_REPO##*/}"
-# 模型路径(两级: 基础盘前缀 + 本仓库目录), 与 llama/launch.sh 的 LLAMA_MODEL_ROOT/DIR 对称
-#   SGLANG_MODEL_ROOT  基础盘前缀(三级优先级, 见下方解析; 与 llama/launch.sh 对称)
+# 模型路径(两级: 基础盘前缀 + 本仓库目录)
+#   SGLANG_MODEL_ROOT  基础盘前缀(三级优先级, 见下方解析)
 #                      换持久化盘只改这一层(或改根 .envrc 的 MODEL_ROOT, 两引擎同时生效)
 #   SGLANG_MODEL_DIR   本仓库模型目录(默认 <ROOT>/<repo名>, 按仓库隔离; 显式设置时原样使用)
 #                      HF ID 启动时权重下载到该目录(见 resolve_model_path), 跨会话可复用;

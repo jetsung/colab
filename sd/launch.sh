@@ -16,7 +16,7 @@
 #   - install 已装好 sd 二进制(colab.sh install sd [--build])
 #   - 首次自动下载模型时需要 `hf` 命令(huggingface_hub, 由 install 装入)
 #
-# 模型组件(每项都可用 <VAR> 直接给本地路径, 或 <VAR>_REPO/<VAR>_FILE 自动下载):
+# 模型组件(每项都可用 <VAR> 直接给模型来源, 或 <VAR>_REPO/<VAR>_FILE 自动下载):
 #   SD_MODEL            -> -m               全模型单文件(SD1.5/SD3/...)
 #   SD_DIFFUSION_MODEL  -> --diffusion-model 组件式扩散主干(FLUX/Qwen-Image/...)
 #   SD_VAE              -> --vae
@@ -25,10 +25,18 @@
 #   SD_CLIP_L / SD_CLIP_G / SD_T5XXL -> --clip_l / --clip_g / --t5xxl (SD3/FLUX, 可选)
 #   SD_MODEL 与 SD_DIFFUSION_MODEL 至少配置一个(见 do_start 校验)
 #
+# <VAR> 单值来源支持四种写法(见 parse_model_source):
+#   本地路径   /abs/path 或 ./rel 或 rel/path(相对当前目录)
+#   file://    file:///abs/path(绝对) 或 file://rel/path(相对当前目录展开) — 直接使用
+#   hf://      hf://<org>/<repo>/<file>
+#   HF https   https://huggingface.co/<org>/<repo>/(blob|resolve)/<rev>/<file>
+#              — 两者先归一为 hf://<org>/<repo>/<file>, 用 hf download 下载到 HF 标准缓存
+#              ~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/ 并定位真实文件路径
+#
 # 环境变量(可被外部/命令行覆盖):
 #   SD_DIR           安装目录(默认 /content/stable-diffusion.cpp)
 #   SD_SERVER / SD_CLI  二进制路径(默认 <SD_DIR>/build/bin/...; 亦从 PATH 查找)
-#   SD_MODEL_ROOT    模型基础盘前缀(回退 MODEL_ROOT, 再兜底 /content/models)
+#   HF 缓存目录遵循 HF_HUB_CACHE / HF_HOME(默认 ~/.cache/huggingface/hub)
 #   SD_HOST / SD_PORT   监听地址与端口(默认 0.0.0.0 / 30000, 与 bore 隧道一致)
 #   SD_STEPS / SD_CFG_SCALE / SD_SAMPLING_METHOD / SD_WIDTH / SD_HEIGHT / SD_SEED
 #                    生成默认参数(留空则不传, 由 sd.cpp 按模型决定)
@@ -127,17 +135,6 @@ else
 fi
 readonly SD_CLI
 
-# 模型基础盘前缀(三级优先级, 与 llama 一致)
-MODEL_ROOT_SOURCE=""
-if [[ -n "${SD_MODEL_ROOT:-}" ]]; then
-  SD_MODEL_ROOT="$SD_MODEL_ROOT"; MODEL_ROOT_SOURCE="SD_MODEL_ROOT"
-elif [[ -n "${MODEL_ROOT:-}" ]]; then
-  SD_MODEL_ROOT="$MODEL_ROOT"; MODEL_ROOT_SOURCE="MODEL_ROOT"
-else
-  SD_MODEL_ROOT="/content/models"; MODEL_ROOT_SOURCE="默认值(兜底)"
-fi
-readonly SD_MODEL_ROOT MODEL_ROOT_SOURCE
-
 # 监听与运行时(仅 start/test/status 需要; 其余子命令无害)
 readonly PORT="${SD_PORT:-30000}"
 readonly HOST="${SD_HOST:-0.0.0.0}"
@@ -168,38 +165,115 @@ wait_stopped() {
   return 1
 }
 
+# 解析模型来源字符串为统一形态, stdout: local|<path> 或 hf|<org>/<repo>|<file>
+# 支持写法:
+#   本地路径  /abs 或 ./rel 或 rel/path(相对当前目录, 原样透传)
+#   file://   file:///abs(绝对路径) 或 file://rel/path(相对当前目录展开)
+#   hf://     hf://<org>/<repo>/<file>
+#   HF https  https://huggingface.co/<org>/<repo>/(blob|resolve)/<rev>/<file>
+parse_model_source() {
+  local val="$1" rest org repo seg3
+  case "$val" in
+    file://*)
+      printf 'local|%s' "${val#file://}"
+      return 0
+      ;;
+    hf://*)
+      rest="${val#hf://}"
+      ;;
+    https://huggingface.co/*)
+      rest="${val#https://huggingface.co/}"
+      org="${rest%%/*}"; rest="${rest#*/}"
+      repo="${rest%%/*}"; rest="${rest#*/}"
+      seg3="${rest%%/*}"
+      if [[ "$seg3" != "blob" && "$seg3" != "resolve" ]]; then
+        echo "ERROR: 不支持的 HF URL(仅支持 /blob/ 或 /resolve/ 文件直链): $val" >&2
+        return 1
+      fi
+      rest="${rest#*/}"   # 跳过 blob|resolve
+      rest="${rest#*/}"   # 跳过 revision
+      if [[ -z "$rest" ]]; then
+        echo "ERROR: HF URL 缺少文件路径: $val" >&2
+        return 1
+      fi
+      printf 'hf|%s/%s|%s' "$org" "$repo" "$rest"
+      return 0
+      ;;
+    *)
+      printf 'local|%s' "$val"
+      return 0
+      ;;
+  esac
+  # hf:// 剩余部分: <org>/<repo>/<file>(file 可含子目录); 至少要有两段 /
+  if [[ "$rest" != */*/* ]]; then
+    echo "ERROR: hf:// 路径需形如 hf://<org>/<repo>/<file>: $val" >&2
+    return 1
+  fi
+  org="${rest%%/*}"; rest="${rest#*/}"
+  repo="${rest%%/*}"; rest="${rest#*/}"
+  printf 'hf|%s/%s|%s' "$org" "$repo" "$rest"
+}
+
+# 在 HF hub 缓存的 snapshots/ 下定位已下载文件, 取最新一份
+#   $1 = models--<org>--<repo> 缓存目录, $2 = 仓库内相对文件路径(可含子目录)
+cache_find() {
+  local found=""
+  found="$(find -L "$1/snapshots" -type f -path "*/$2" -printf '%T@ %p\n' 2>/dev/null \
+    | sort -n | tail -1 | cut -d' ' -f2-)"
+  [[ -n "$found" && -f "$found" ]] && printf '%s' "$found"
+  return 0
+}
+
 # 解析单个模型组件: resolve_component <VAR名>
 #   stdout: 解析后的本地路径(未配置则为空串)
 #   stderr: 进度/错误信息
-# 顺序: <VAR> 显式路径 > 本地 <MODEL_ROOT>/<repo名>/<file> > hf download
+# 优先级: <VAR> 单值来源 > <VAR>_REPO/<VAR>_FILE 组合
+#   - 本地路径 / file://    直接使用, 不联网不下载
+#   - hf:// / HF https URL  归一为 hf://<org>/<repo>/<file>, 先查 HF hub 标准缓存
+#     (~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/), 未命中则
+#     hf download hf://<org>/<repo>/<file> 下载, 再从 snapshots/ 定位真实文件路径
 resolve_component() {
   local name="$1"
+  local repo="" file=""
+
   local explicit="${!name:-}"
   if [[ -n "$explicit" ]]; then
-    if [[ ! -f "$explicit" ]]; then
-      echo "ERROR: ${name} 指向的文件不存在: $explicit" >&2
+    local parsed
+    parsed="$(parse_model_source "$explicit")" || return 1
+    if [[ "$parsed" == 'local|'* ]]; then
+      local local_path="${parsed#local|}"
+      if [[ ! -f "$local_path" ]]; then
+        echo "ERROR: ${name} 指向的文件不存在: $local_path" >&2
+        return 1
+      fi
+      printf '%s' "$local_path"
+      return 0
+    fi
+    parsed="${parsed#hf|}"
+    repo="${parsed%%|*}"
+    file="${parsed#*|}"
+  else
+    local repo_var="${name}_REPO" file_var="${name}_FILE"
+    repo="${!repo_var:-}" file="${!file_var:-}"
+    if [[ -z "$repo" && -z "$file" ]]; then
+      return 0
+    fi
+    if [[ -z "$repo" || -z "$file" ]]; then
+      echo "ERROR: ${name} 需同时设置 ${repo_var} 与 ${file_var}(或直接给 ${name} 单值来源)" >&2
       return 1
     fi
-    printf '%s' "$explicit"
-    return 0
   fi
 
-  local repo_var="${name}_REPO" file_var="${name}_FILE"
-  local repo="${!repo_var:-}" file="${!file_var:-}"
-  if [[ -z "$repo" && -z "$file" ]]; then
-    return 0
-  fi
-  if [[ -z "$repo" || -z "$file" ]]; then
-    echo "ERROR: ${name} 需同时设置 ${repo_var} 与 ${file_var}(或直接给 ${name} 本地路径)" >&2
-    return 1
-  fi
+  # HF 来源: hub 缓存目录 models--<org>--<repo>(仓库路径中的 / 替换为 --)
+  local hub_dir="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+  local model_dir="${hub_dir}/models--${repo//\//--}"
+  local hf_url="hf://${repo}/${file}"
 
-  local repo_name="${repo##*/}"
-  local local_dir="${SD_MODEL_ROOT}/${repo_name}"
-  local dest="${local_dir}/${file}"
-  if [[ -f "$dest" ]]; then
-    echo ">> [${name}] 本地已存在: ${dest}" >&2
-    printf '%s' "$dest"
+  local found
+  found="$(cache_find "$model_dir" "$file")"
+  if [[ -n "$found" ]]; then
+    echo ">> [${name}] 缓存已存在: ${found}" >&2
+    printf '%s' "$found"
     return 0
   fi
 
@@ -207,19 +281,34 @@ resolve_component() {
     echo "ERROR: 未找到 hf 命令(用于下载模型)。请先执行: ./colab.sh install sd" >&2
     return 1
   fi
-  echo ">> [${name}] 下载 ${repo} -> ${file}" >&2
-  mkdir -p "$local_dir"
-  local -a dl=(hf download "$repo" --include "$file" --local-dir "$local_dir")
+  echo ">> [${name}] 下载 ${hf_url}" >&2
+  local out=""
   if [[ "$SD_XET" == "1" ]]; then
-    HF_HUB_ENABLE_XET=1 HF_TOKEN="${HF_TOKEN:-}" "${dl[@]}" >&2
+    out="$(HF_HUB_ENABLE_XET=1 HF_TOKEN="${HF_TOKEN:-}" hf download "$hf_url")" || {
+      echo "ERROR: hf download 失败: ${hf_url}" >&2
+      return 1
+    }
   else
-    HF_TOKEN="${HF_TOKEN:-}" "${dl[@]}" >&2
+    out="$(HF_TOKEN="${HF_TOKEN:-}" hf download "$hf_url")" || {
+      echo "ERROR: hf download 失败: ${hf_url}" >&2
+      return 1
+    }
   fi
-  if [[ ! -f "$dest" ]]; then
-    echo "ERROR: 下载完成但未找到文件: ${dest}" >&2
-    return 1
+  # hf download 成功时 stdout 末行为下载文件路径(新版格式 "  path: <路径>", 旧版为裸路径),
+  # 解析失效则回退到缓存查找
+  out="${out##*$'\n'}"
+  out="${out##*'path: '}"
+  if [[ -n "$out" && -f "$out" ]]; then
+    printf '%s' "$out"
+    return 0
   fi
-  printf '%s' "$dest"
+  found="$(cache_find "$model_dir" "$file")"
+  if [[ -n "$found" ]]; then
+    printf '%s' "$found"
+    return 0
+  fi
+  echo "ERROR: 下载完成但未定位到文件: ${file} (缓存目录: ${model_dir})" >&2
+  return 1
 }
 
 # 组装模型参数到全局 MODEL_ARGS; 校验至少配置一个主模型
@@ -311,11 +400,6 @@ do_start() {
     exit 1
   fi
 
-  if [[ "$SD_MODEL_ROOT" == /content/drive/* || "$SD_MODEL_ROOT" == /content/drive ]]; then
-    echo "ERROR: 不支持 Google Drive 作为模型目录: $SD_MODEL_ROOT" >&2
-    exit 1
-  fi
-
   check_binary "$SD_SERVER" "手动验证: command -v sd-server"
   build_model_args
   build_gen_args
@@ -325,7 +409,6 @@ do_start() {
   local LAUNCH_CMD=("$SD_SERVER" "${MODEL_ARGS[@]}" "${GEN_ARGS[@]}" -l "$HOST" --listen-port "$PORT")
 
   echo "启动 sd-server... (日志: ${LOG_FILE})" | tee -a "$LOG_FILE"
-  echo ">> 模型目录: $SD_MODEL_ROOT (来源: $MODEL_ROOT_SOURCE)" | tee -a "$LOG_FILE"
   echo ">> 启动命令: ${LAUNCH_CMD[*]}" | tee -a "$LOG_FILE"
   {
     echo "===== $(date '+%F %T') [sd] start ====="

@@ -12,19 +12,16 @@
 export SD_DIR="${SD_DIR:-/content/stable-diffusion.cpp}"
 
 # ---- 默认模型: Qwen-Image-2.1 三件套 ----
-# sd.cpp 的组件式模型拆成 3 个 HF 仓库: 扩散主干(GGUF) + VAE(safetensors) + 文本编码器(GGUF)。
-# 每项都可用 *_REPO / *_FILE 覆盖; 也可用 SD_DIFFUSION_MODEL / SD_VAE / SD_LLM 直接给本地绝对路径。
-export SD_DIFFUSION_MODEL_REPO="${SD_DIFFUSION_MODEL_REPO:-unsloth/Qwen-Image-2.1-GGUF}"
-export SD_DIFFUSION_MODEL_FILE="${SD_DIFFUSION_MODEL_FILE:-qwen-image-2.1-Q4_K_M.gguf}"
-export SD_VAE_REPO="${SD_VAE_REPO:-unsloth/Qwen-Image-2.1-FP8}"
-export SD_VAE_FILE="${SD_VAE_FILE:-vae/qwen_image_2.1_vae_bf16.safetensors}"
-export SD_LLM_REPO="${SD_LLM_REPO:-unsloth/Qwen3-VL-8B-Instruct-GGUF}"
-export SD_LLM_FILE="${SD_LLM_FILE:-Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf}"
+# 每项用 <VAR> 单值来源: hf://<org>/<repo>/<file>(经 hf download 下载到 HF 标准缓存
+# ~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/ 后定位真实路径),
+# 也支持 https://huggingface.co/.../blob/main/<file>、file://本地路径、本地路径(见 launch.sh)。
+export SD_DIFFUSION_MODEL="${SD_DIFFUSION_MODEL:-hf://unsloth/Qwen-Image-2.1-GGUF/qwen-image-2.1-Q4_K_M.gguf}"
+export SD_VAE="${SD_VAE:-hf://unsloth/Qwen-Image-2.1-FP8/vae/qwen_image_2.1_vae_bf16.safetensors}"
+export SD_LLM="${SD_LLM:-hf://unsloth/Qwen3-VL-8B-Instruct-GGUF/Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf}"
 
 # 图生图/编辑用的视觉投影器(Qwen-Image-2.1 走 Qwen3-VL, 需 --llm_vision)。
 # 默认不下载; 需要图片编辑时取消注释(约 1.7GB)。
-# export SD_LLM_VISION_REPO="${SD_LLM_VISION_REPO:-unsloth/Qwen3-VL-8B-Instruct-GGUF}"
-# export SD_LLM_VISION_FILE="${SD_LLM_VISION_FILE:-mmproj-F16.gguf}"
+# export SD_LLM_VISION="${SD_LLM_VISION:-hf://unsloth/Qwen3-VL-8B-Instruct-GGUF/mmproj-F16.gguf}"
 
 # ---- 生成默认参数(用户实测值) ----
 export SD_STEPS="${SD_STEPS:-20}"
@@ -39,5 +36,6 @@ export SD_HOST="${SD_HOST:-0.0.0.0}"
 export SD_PORT="${SD_PORT:-30000}"
 
 # 临时切换(不改动本文件):
-#   SD_DIFFUSION_MODEL_FILE=qwen-image-2.1-Q8_0.gguf ./launch.sh start
+#   SD_DIFFUSION_MODEL=hf://unsloth/Qwen-Image-2.1-GGUF/qwen-image-2.1-Q8_0.gguf ./launch.sh start
+#   SD_DIFFUSION_MODEL=file:///content/models/Qwen-Image-2.1-GGUF/qwen-image-2.1-Q8_0.gguf ./launch.sh start
 #   SD_STEPS=30 ./launch.sh generate
